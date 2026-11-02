@@ -49,11 +49,15 @@ end
 -- Quiet by default: state remains inspectable even if initialization yields.
 -- The separate diagnostic executable opts into console output for one launch.
 local startupEnvironment = getgenv and getgenv() or getfenv()
-local startup = { state = "loading", stage = "Main", started = os.clock(), trace = {},
+local startup = { state = "loading", stage = "Main", started = os.clock(), trace = {}, timings = {},
 	debug = startupEnvironment.AeroStartupDebug == true or startupEnvironment.AeroStartupDebugOnce == true }
+startup.stageStarted = startup.started
 startupEnvironment.AeroStartupDebugOnce = nil
 startupEnvironment.AeroStartupStatus = startup
 function startup:step(stage)
+	local now = os.clock()
+	self.timings[#self.timings + 1] = { stage = self.stage, seconds = now - self.stageStarted }
+	self.stageStarted = now
 	self.stage = stage
 	self.trace[#self.trace + 1] = stage
 	if self.debug then warn("[Aero/diag] STARTUP: " .. stage) end
@@ -82,15 +86,14 @@ end
 do
 	local deadline = os.clock() + 3
 
-	repeat
-		task.wait()
-
+	while true do
 		local localPlayer = services.Players.LocalPlayer
 
-		if localPlayer and localPlayer:FindFirstChild("PlayerScripts") then
+		if (localPlayer and localPlayer:FindFirstChild("PlayerScripts")) or os.clock() >= deadline then
 			break
 		end
-	until os.clock() >= deadline
+		task.wait()
+	end
 end
 
 loadstring("getfenv().LPH_NO_VIRTUALIZE = function(...) return ... end")()
@@ -322,17 +325,18 @@ function Aero.init()
 	startupStep("Waiting for LocalPlayer")
 	local localPlayer = nil
 
-	repeat
+	while not game:IsLoaded() do
 		task.wait()
-	until game:IsLoaded()
+	end
 
 	-- Client prep -- the loading-screen A-spam (resume-gated) and the LocalPlayer/PlayerScripts/Character
 	-- wait -- now runs in the loader (luarmor VM) BEFORE the core is executed, so the client is already
 	-- ready here. We just resolve LocalPlayer (instant) and hook.
-	repeat
-		localPlayer = playersService.LocalPlayer
+	localPlayer = playersService.LocalPlayer
+	while not localPlayer do
 		task.wait()
-	until localPlayer ~= nil
+		localPlayer = playersService.LocalPlayer
+	end
 
 	if game.PlaceId ~= LOBBY_PLACE_ID then
 		-- Start the init timer here. The character wait already happened in the loader, so this measures
@@ -50528,7 +50532,10 @@ return LPH_NO_VIRTUALIZE(function()
 				-- Live theme colors supersede a pending tween to an older palette.
 				local motion = Library.Motion and Library.Motion[Object.Instance]
 				if motion and motion.goals[Property] ~= nil then
+					local remaining = table.clone(motion.goals)
+					remaining[Property] = nil
 					motion.connection:Disconnect(); motion.tween:Cancel(); Library.Motion[Object.Instance] = nil
+					if next(remaining) then Library:Animate(Object.Instance, remaining) end
 				end
 				if type(ColorIdx) == "string" then
 					Object.Instance[Property] = Library[ColorIdx]
@@ -50592,7 +50599,12 @@ return LPH_NO_VIRTUALIZE(function()
 	Library.Motion = {}
 	function Library:Animate(Object, Goals, Duration)
 		local previous = self.Motion[Object]
-		if previous then previous.connection:Disconnect(); previous.tween:Cancel(); self.Motion[Object] = nil end
+		if previous then
+			local combined = table.clone(previous.goals)
+			for key, value in pairs(Goals) do combined[key] = value end
+			Goals = combined
+			previous.connection:Disconnect(); previous.tween:Cancel(); self.Motion[Object] = nil
+		end
 		local changed = false
 		for key, value in pairs(Goals) do if Object[key] ~= value then changed = true; break end end
 		if not changed then return end
@@ -50904,7 +50916,7 @@ return LPH_NO_VIRTUALIZE(function()
 			end
 
 			local DisplayLabel = Library:CreateLabel({
-				Size = UDim2.new(1, 0, 0, 14),
+				Size = UDim2.new(1, -82, 0, 14),
 				Position = UDim2.fromOffset(10, 10),
 				TextXAlignment = Enum.TextXAlignment.Left,
 				TextSize = 12,
@@ -50913,6 +50925,23 @@ return LPH_NO_VIRTUALIZE(function()
 				ZIndex = 16,
 				Parent = PickerFrameInner,
 			})
+			local function colorPreview(name, x)
+				local checker = Library:Create("ImageLabel", { Name = name .. "Checker", BackgroundTransparency = 1,
+					BorderSizePixel = 0, Image = "http://www.roblox.com/asset/?id=12977615774",
+					Position = UDim2.fromOffset(x, 16), Size = UDim2.fromOffset(20, 12), ZIndex = 18, Parent = PickerFrameInner })
+				local swatch = Library:Create("Frame", { Name = name, BackgroundColor3 = ColorPicker.Value,
+					BackgroundTransparency = ColorPicker.Transparency, BorderColor3 = Library.OutlineColor,
+					Size = UDim2.fromScale(1, 1), ZIndex = 19, Parent = checker })
+				Library:AddToRegistry(swatch, { BorderColor3 = "OutlineColor" })
+				Library:StyleSurface(swatch, 3, 0.2)
+				return swatch
+			end
+			local previousPreview, currentPreview = colorPreview("PreviousColor", 186), colorPreview("CurrentColor", 212)
+			for _, item in ipairs({ { "Antes", 182 }, { "Ahora", 208 } }) do
+				Library:CreateLabel({ Text = item[1], TextSize = 8, TextTransparency = 0.35,
+					Position = UDim2.fromOffset(item[2], 4), Size = UDim2.fromOffset(28, 10),
+					ZIndex = 19, Parent = PickerFrameInner })
+			end
 
 			Library:StyleSurface(DisplayFrame, 3, 0.2)
 			DisplayFrame.BorderColor3 = Library.OutlineColor
@@ -51063,7 +51092,7 @@ return LPH_NO_VIRTUALIZE(function()
 					if not Library.ColorClipboard then
 						return Library:Notify("You have not copied a color!", 2)
 					end
-					ColorPicker:SetValueRGB(Library.ColorClipboard)
+					ColorPicker:SetValueRGB(Library.ColorClipboard, ColorPicker.Transparency)
 				end)
 
 				ContextMenu:AddOption("Copy HEX", function()
@@ -51148,6 +51177,8 @@ return LPH_NO_VIRTUALIZE(function()
 				if ColorPicker.Rainbow then
 					ColorPicker.Value = Library.CurrentRainbowColor or Color3.fromHSV(Hue or 0, 1, 1)
 				end
+				currentPreview.BackgroundColor3 = ColorPicker.Value
+				currentPreview.BackgroundTransparency = ColorPicker.Transparency
 
 				Library:Create(DisplayFrame, {
 					BackgroundColor3 = ColorPicker.Value,
@@ -51170,6 +51201,9 @@ return LPH_NO_VIRTUALIZE(function()
 					math.floor(ColorPicker.Value.B * 255),
 				}, ", ")
 
+				if Info.TransparencyCallback then
+					Library:SafeCallback("ColorPicker_Transparency_" .. (Idx or ""), Info.TransparencyCallback, ColorPicker.Transparency)
+				end
 				Library:SafeCallback(
 					"ColorPicker_Callback" .. "_" .. (Idx or ""),
 					ColorPicker.Callback,
@@ -51188,6 +51222,10 @@ return LPH_NO_VIRTUALIZE(function()
 			end
 
 			function ColorPicker:Show()
+				if not PickerFrameOuter.Visible then
+					previousPreview.BackgroundColor3 = ColorPicker.Value
+					previousPreview.BackgroundTransparency = ColorPicker.Transparency
+				end
 				for Frame, Val in next, Library.OpenedFrames do
 					if Frame.Name == "Color" then
 						Frame.Visible = false
@@ -51322,6 +51360,7 @@ return LPH_NO_VIRTUALIZE(function()
 			end)
 			ColorPicker:Display()
 			ColorPicker.DisplayFrame, ColorPicker.Popup = DisplayFrame, PickerFrameOuter
+			ColorPicker.PreviousPreview, ColorPicker.CurrentPreview = previousPreview, currentPreview
 			ColorPicker.HexInput, ColorPicker.RgbInput = HueBox, RgbBox
 
 			if Idx then
@@ -51924,6 +51963,7 @@ return LPH_NO_VIRTUALIZE(function()
 				Inner.BorderSizePixel = 0
 				Outer.BackgroundColor3 = Library.MainColor
 				Library.RegistryMap[Outer].Properties.BackgroundColor3 = "MainColor"
+				if Library.Appearance then Library.Appearance:RegisterSurface(Outer, "MainColor") end
 				return Outer, Inner, Label
 			end
 
@@ -52152,6 +52192,7 @@ return LPH_NO_VIRTUALIZE(function()
 			Library:StyleSurface(TextBoxOuter, 4)
 			TextBoxOuter.BackgroundColor3 = Library.MainColor
 			Library.RegistryMap[TextBoxOuter].Properties.BackgroundColor3 = "MainColor"
+			if Library.Appearance then Library.Appearance:RegisterSurface(TextBoxOuter, "MainColor") end
 			TextBoxInner.BackgroundTransparency = 1
 			TextBoxInner.BorderSizePixel = 0
 
@@ -52292,11 +52333,12 @@ return LPH_NO_VIRTUALIZE(function()
 
 			local Groupbox = self
 			local Container = Groupbox.Container
+			local toggleSize = Groupbox.IsDependency and 14 or 17
 
 			local ToggleOuter = Library:Create("Frame", {
 				BackgroundColor3 = Color3.new(0, 0, 0),
 				BorderColor3 = Color3.new(0, 0, 0),
-				Size = UDim2.new(0, 17, 0, 17),
+				Size = UDim2.new(0, toggleSize, 0, toggleSize),
 				ZIndex = 5,
 				Parent = Container,
 			})
@@ -52322,7 +52364,7 @@ return LPH_NO_VIRTUALIZE(function()
 			local ToggleLabel = Library:CreateLabel({
 				Size = UDim2.new(0, 216, 1, 0),
 				Position = UDim2.new(1, 6, 0, 0),
-				TextSize = 12,
+				TextSize = Groupbox.IsDependency and 11 or 12,
 				Text = Info.Text,
 				TextXAlignment = Enum.TextXAlignment.Left,
 				ZIndex = 6,
@@ -52349,8 +52391,8 @@ return LPH_NO_VIRTUALIZE(function()
 				local width = Container.AbsoluteSize.X / Library.UIScale
 				if previousWidth == width then return end
 				previousWidth = width
-				ToggleLabel.Size = UDim2.new(0, math.max(0, Container.AbsoluteSize.X / Library.UIScale - 23), 1, 0)
-				ToggleRegion.Size = UDim2.new(0, math.max(17, Container.AbsoluteSize.X / Library.UIScale), 1, 0)
+				ToggleLabel.Size = UDim2.new(0, math.max(0, Container.AbsoluteSize.X / Library.UIScale - toggleSize - 6), 1, 0)
+				ToggleRegion.Size = UDim2.new(0, math.max(toggleSize, Container.AbsoluteSize.X / Library.UIScale), 1, 0)
 			end
 			Container:GetPropertyChangedSignal("AbsoluteSize"):Connect(ResizeToggle)
 			ResizeToggle()
@@ -52358,6 +52400,14 @@ return LPH_NO_VIRTUALIZE(function()
 			ToggleOuter.BorderColor3 = Library.OutlineColor
 			Library.RegistryMap[ToggleOuter].Properties.BorderColor3 = "OutlineColor"
 			Library:StyleSurface(ToggleOuter, 4)
+			ToggleOuter.BackgroundTransparency = 1
+			if Library.Appearance then Library.Appearance:RegisterSurface(ToggleInner, "MainColor") end
+			if Groupbox.IsDependency then
+				local branch = Library:Create("Frame", { Name = "DependencyBranch", BackgroundColor3 = Library.OutlineColor,
+					BackgroundTransparency = 0.25, BorderSizePixel = 0, Position = UDim2.fromOffset(-9, math.floor(toggleSize / 2)),
+					Size = UDim2.fromOffset(9, 1), ZIndex = 4, Parent = ToggleOuter })
+				Library:AddToRegistry(branch, { BackgroundColor3 = "OutlineColor" })
+			end
 			roundInner(ToggleInner, 4)
 			local ToggleGradient = Library.Appearance and Library.Appearance:AddGradient(ToggleInner, Toggle.Value)
 			local Hover = Library:Create("Frame", { Name = "ToggleHover", BackgroundColor3 = Library.AccentColor,
@@ -52390,11 +52440,23 @@ return LPH_NO_VIRTUALIZE(function()
 				Library:AddToolTip(Info.Tooltip, ToggleRegion)
 			end
 
-			function Toggle:Display()
+			function Toggle:Display(animate)
 				if ToggleGradient then ToggleGradient.Enabled = Toggle.Value end
 				if Library.Appearance then Library.Appearance:QueueVisible() end
-				ToggleInner.BackgroundColor3 = Toggle.Value and Library.AccentColor or Library.MainColor
-				ToggleInner.BorderColor3 = Toggle.Value and Library.AccentColorDark or Library.OutlineColor
+				local color = Toggle.Value and Library.AccentColor or Library.MainColor
+				local border = Toggle.Value and Library.AccentColorDark or Library.OutlineColor
+				if animate then
+					Library:Animate(ToggleInner, { BackgroundColor3 = color, BorderColor3 = border }, 0.12)
+				else
+					local motion = Library.Motion[ToggleInner]
+					if motion then
+						local remaining = table.clone(motion.goals)
+						remaining.BackgroundColor3, remaining.BorderColor3 = nil, nil
+						motion.connection:Disconnect(); motion.tween:Cancel(); Library.Motion[ToggleInner] = nil
+						if next(remaining) then Library:Animate(ToggleInner, remaining) end
+					end
+					ToggleInner.BackgroundColor3, ToggleInner.BorderColor3 = color, border
+				end
 
 				Library.RegistryMap[ToggleInner].Properties.BackgroundColor3 = Toggle.Value and "AccentColor"
 					or "MainColor"
@@ -52423,11 +52485,11 @@ return LPH_NO_VIRTUALIZE(function()
 				Library:UpdateDependencyBoxes()
 			end
 
-			function Toggle:SetValue(Bool)
+			function Toggle:SetValue(Bool, animate)
 				Bool = not not Bool
 
 				Toggle.Value = Bool
-				Toggle:Display()
+				Toggle:Display(animate)
 
 				for _, Addon in next, Toggle.Addons do
 					if Addon.Type == "KeyPicker" and Addon.SyncToggleState then
@@ -52443,7 +52505,7 @@ return LPH_NO_VIRTUALIZE(function()
 
 			ToggleRegion.InputBegan:Connect(function(Input)
 				if Input.UserInputType == Enum.UserInputType.MouseButton1 and not Library:MouseIsOverOpenedFrame() then
-					Toggle:SetValue(not Toggle.Value) -- Why was it not like this from the start?
+					Toggle:SetValue(not Toggle.Value, true)
 					Library:AttemptSave()
 				end
 			end)
@@ -52561,6 +52623,7 @@ return LPH_NO_VIRTUALIZE(function()
 
 			SliderOuter.BackgroundColor3 = Library.MainColor
 			Library.RegistryMap[SliderOuter].Properties.BackgroundColor3 = "MainColor"
+			if Library.Appearance then Library.Appearance:RegisterSurface(SliderOuter, "MainColor") end
 			Library:StyleSurface(SliderOuter, 4)
 			SliderInner.BackgroundTransparency = 1
 			SliderInner.BorderSizePixel = 0
@@ -52612,7 +52675,10 @@ return LPH_NO_VIRTUALIZE(function()
 				end
 
 				local X = math.ceil(Library:MapValue(Slider.Value, Slider.Min, Slider.Max, 0, Slider.MaxSize))
-				Fill.Size = UDim2.new(0, X, 1, 0)
+				-- Preserve a readable rounded gradient for small positive fills; the value and
+				-- mouse mapping still use the full, exact slider range.
+				local visibleWidth = X > 0 and math.min(Slider.MaxSize, math.max(X, 8)) or 0
+				Fill.Size = UDim2.new(0, visibleWidth, 1, 0)
 
 				local wasVisible = Fill.Visible
 				Fill.Visible = X > 0
@@ -52875,6 +52941,7 @@ return LPH_NO_VIRTUALIZE(function()
 			Library:StyleSurface(DropdownOuter, 4)
 			DropdownOuter.BackgroundColor3 = Library.MainColor
 			Library.RegistryMap[DropdownOuter].Properties.BackgroundColor3 = "MainColor"
+			if Library.Appearance then Library.Appearance:RegisterSurface(DropdownOuter, "MainColor") end
 			DropdownInner.BackgroundTransparency = 1
 			DropdownInner.BorderSizePixel = 0
 
@@ -52913,6 +52980,8 @@ return LPH_NO_VIRTUALIZE(function()
 			end
 
 			local function RecalculateListSize(YSize)
+				local motion = Library.Motion[ListOuter]
+				if motion then motion.connection:Disconnect(); motion.tween:Cancel(); Library.Motion[ListOuter] = nil end
 				ListOuter.Size = UDim2.fromOffset(DropdownOuter.AbsoluteSize.X / Library.UIScale, YSize or (MAX_DROPDOWN_ITEMS * RowHeight + 28))
 			end
 
@@ -53166,18 +53235,34 @@ return LPH_NO_VIRTUALIZE(function()
 				Dropdown:Filter()
 				ListOuter.Visible = true
 				RecalculateListPosition()
+				local targetSize, targetPosition = ListOuter.Size, ListOuter.Position
+				local startHeight = math.min(24, targetSize.Y.Offset)
+				ListOuter.ClipsDescendants = true
+				ListOuter.Size = UDim2.fromOffset(targetSize.X.Offset, startHeight)
+				if targetPosition.Y.Offset < DropdownOuter.AbsolutePosition.Y then
+					ListOuter.Position = UDim2.fromOffset(targetPosition.X.Offset,
+						targetPosition.Y.Offset + (targetSize.Y.Offset - startHeight) * Library.UIScale)
+				end
+				Library:Animate(ListOuter, { Size = targetSize, Position = targetPosition }, 0.15)
 				Library.OpenedFrames[ListOuter] = true
-				DropdownArrow.Rotation = 180
+				Library:Animate(DropdownArrow, { Rotation = 180 }, 0.14)
 				SetOpenBorder(true)
 				if SearchBox.Visible then SearchBox:CaptureFocus() end
 			end
 
 			function Dropdown:CloseDropdown()
 				if not ListOuter.Visible and not SearchBox:IsFocused() then return end
+				local motion = Library.Motion[ListOuter]
+				if motion then
+					local targetSize, targetPosition = motion.goals.Size, motion.goals.Position
+					motion.connection:Disconnect(); motion.tween:Cancel(); Library.Motion[ListOuter] = nil
+					if targetSize then ListOuter.Size = targetSize end
+					if targetPosition then ListOuter.Position = targetPosition end
+				end
 				ListOuter.Visible = false
 				SearchBox:ReleaseFocus()
 				Library.OpenedFrames[ListOuter] = nil
-				DropdownArrow.Rotation = 0
+				Library:Animate(DropdownArrow, { Rotation = 0 }, 0.14)
 				SetOpenBorder(false)
 			end
 
@@ -53316,7 +53401,7 @@ return LPH_NO_VIRTUALIZE(function()
 		-- A presentation-only fold: option values and dependency rules stay intact.
 		function Funcs:AddCollapsible(Text)
 			local Parent = self
-			local Section = { Name = Parent.Name, OwnerTab = Parent.OwnerTab, Expanded = false }
+			local Section = { Name = Parent.Name, OwnerTab = Parent.OwnerTab, Expanded = false, IsDependency = Parent.IsDependency }
 			local Header = Library:Create("TextButton", {
 				Text = Text, AutoButtonColor = false, TextXAlignment = Enum.TextXAlignment.Left,
 				FontFace = Library.Font, TextSize = 11, TextColor3 = Library.FontColor,
@@ -53376,6 +53461,7 @@ return LPH_NO_VIRTUALIZE(function()
 		function Funcs:AddDependencyBox()
 			local Depbox = {
 				Dependencies = {},
+				IsDependency = true,
 			}
 
 			local Groupbox = self
@@ -53390,10 +53476,15 @@ return LPH_NO_VIRTUALIZE(function()
 
 			local Frame = Library:Create("Frame", {
 				BackgroundTransparency = 1,
-				Size = UDim2.new(1, 0, 1, 0),
+				Position = UDim2.fromOffset(12, 0),
+				Size = UDim2.new(1, -12, 1, 0),
 				Visible = true,
 				Parent = Holder,
 			})
+			local trunk = Library:Create("Frame", { Name = "DependencyTrunk", BackgroundColor3 = Library.OutlineColor,
+				BackgroundTransparency = 0.25, BorderSizePixel = 0, Position = UDim2.fromOffset(3, 0),
+				Size = UDim2.new(0, 1, 1, 0), ZIndex = 4, Parent = Holder })
+			Library:AddToRegistry(trunk, { BackgroundColor3 = "OutlineColor" })
 
 			local Layout = Library:Create("UIListLayout", {
 				FillDirection = Enum.FillDirection.Vertical,
@@ -53853,12 +53944,14 @@ return LPH_NO_VIRTUALIZE(function()
 		})
 
 		Library:AddToRegistry(Outer, { BackgroundColor3 = "BackgroundColor", BorderColor3 = "OutlineColor" })
+		if Library.Appearance then Library.Appearance:RegisterSurface(Outer, "BackgroundColor") end
 		Outer.BorderColor3 = Library.OutlineColor
 		Library:StyleSurface(Outer, 5, 0.55)
 		Library:MakeDraggable(Outer, 38)
 
 		local Inner = Library:Create("Frame", {
 			BackgroundColor3 = Library.BackgroundColor,
+			BackgroundTransparency = 1,
 			BorderColor3 = Library.OutlineColor,
 			BorderSizePixel = 0,
 			Position = UDim2.fromOffset(0, 0),
@@ -53896,6 +53989,7 @@ return LPH_NO_VIRTUALIZE(function()
 
 		local MainSectionOuter = Library:Create("Frame", {
 			BackgroundColor3 = Library.BackgroundColor,
+			BackgroundTransparency = 1,
 			BorderColor3 = Library.OutlineColor,
 			BorderSizePixel = 0,
 			Position = UDim2.fromOffset(10, 44),
@@ -53911,6 +54005,7 @@ return LPH_NO_VIRTUALIZE(function()
 
 		local MainSectionInner = Library:Create("Frame", {
 			BackgroundColor3 = Library.BackgroundColor,
+			BackgroundTransparency = 1,
 			BorderColor3 = Color3.new(0, 0, 0),
 			BorderSizePixel = 0,
 			Position = UDim2.new(0, 0, 0, 0),
@@ -53950,6 +54045,7 @@ return LPH_NO_VIRTUALIZE(function()
 			BorderSizePixel = 0, Position = UDim2.fromOffset(0, 26), Size = UDim2.fromOffset(0, 2),
 			Visible = false, ZIndex = 4, Parent = IndicatorViewport })
 		Library:AddToRegistry(ActiveLine, { BackgroundColor3 = "AccentColor" })
+		if Library.Appearance then Library.Appearance:AddGradient(ActiveLine) end
 		Window.TabIndicator, Window.TabArea = ActiveLine, TabArea
 		local selectedButton
 		local function moveIndicator(animate)
@@ -53959,15 +54055,24 @@ return LPH_NO_VIRTUALIZE(function()
 			if animate and ActiveLine.Visible then Library:Animate(ActiveLine, goals, 0.2)
 			else
 				local previous = Library.Motion[ActiveLine]
-				if previous then previous.connection:Disconnect(); previous.tween:Cancel(); Library.Motion[ActiveLine] = nil end
+				local remaining
+				if previous then
+					remaining = table.clone(previous.goals)
+					remaining.Position, remaining.Size = nil, nil
+					previous.connection:Disconnect(); previous.tween:Cancel(); Library.Motion[ActiveLine] = nil
+				end
 				for key, value in pairs(goals) do ActiveLine[key] = value end
+				if remaining and next(remaining) then Library:Animate(ActiveLine, remaining) end
 			end
+			local wasVisible = ActiveLine.Visible
 			ActiveLine.Visible = true
+			if not wasVisible and Library.Appearance then Library.Appearance:QueueVisible() end
 		end
 		TabArea:GetPropertyChangedSignal("CanvasPosition"):Connect(function() moveIndicator(false) end)
 
 		local TabContainer = Library:Create("Frame", {
 			BackgroundColor3 = Library.BackgroundColor,
+			BackgroundTransparency = 1,
 			BorderColor3 = Library.OutlineColor,
 			BorderSizePixel = 0,
 			Position = UDim2.fromOffset(0, 30),
@@ -54177,7 +54282,8 @@ return LPH_NO_VIRTUALIZE(function()
 					BackgroundColor3 = "InnerBoxColor",
 				})
 
-				Library:StyleSurface(BoxOuter, 4, 0.18)
+				Library:StyleSurface(BoxOuter, 4, 0.55)
+				if Library.Appearance then Library.Appearance:RegisterSurface(BoxOuter, "InnerBoxColor") end
 				BoxInner.BackgroundTransparency = 1
 				BoxInner.BorderSizePixel = 0
 
@@ -54265,8 +54371,14 @@ return LPH_NO_VIRTUALIZE(function()
 				if animate and CategoryLine.Visible then Library:Animate(CategoryLine, goals, 0.2)
 				else
 					local motion = Library.Motion[CategoryLine]
-					if motion then motion.connection:Disconnect(); motion.tween:Cancel(); Library.Motion[CategoryLine] = nil end
+					local remaining
+					if motion then
+						remaining = table.clone(motion.goals)
+						remaining.Position, remaining.Size = nil, nil
+						motion.connection:Disconnect(); motion.tween:Cancel(); Library.Motion[CategoryLine] = nil
+					end
 					for key, value in pairs(goals) do CategoryLine[key] = value end
+					if remaining and next(remaining) then Library:Animate(CategoryLine, remaining) end
 				end
 				CategoryLine.Visible = true
 			end
@@ -54439,7 +54551,8 @@ return LPH_NO_VIRTUALIZE(function()
 					BackgroundColor3 = "InnerBoxColor",
 				})
 
-				Library:StyleSurface(BoxOuter, 4, 0.18)
+				Library:StyleSurface(BoxOuter, 4, 0.55)
+				if Library.Appearance then Library.Appearance:RegisterSurface(BoxOuter, "InnerBoxColor") end
 				BoxInner.BackgroundTransparency = 1
 				BoxInner.BorderSizePixel = 0
 
@@ -54649,21 +54762,29 @@ return LPH_NO_VIRTUALIZE(function()
 			Parent = ScreenGui,
 		})
 
-		local TransparencyCache = {}
+		local TransparencyCache = setmetatable({}, { __mode = "k" })
 		local Fading = false
-		local FirstTime = false
+		local fadeEpoch = 0
+		function Window:SetSurfaceTransparency(object, value)
+			local cached = TransparencyCache[object]
+			if cached then cached.BackgroundTransparency = value end
+			local motion = Library.Motion[object]
+			if Fading and Toggled and motion and motion.goals.BackgroundTransparency ~= nil then
+				local goals = table.clone(motion.goals)
+				goals.BackgroundTransparency = value
+				Library:Animate(object, goals, Config.MenuFadeTime)
+			elseif not Fading or Toggled then
+				object.BackgroundTransparency = value
+			end
+		end
 
 		function Library:Toggle()
-			if Fading then
-				return
-			end
-
 			local FadeTime = Config.MenuFadeTime
 			local ShouldFade = FadeTime > 0.01
-
-			if ShouldFade then
-				Fading = true
-			end
+			local wasFading = Fading
+			Fading = ShouldFade
+			fadeEpoch = fadeEpoch + 1
+			local epoch = fadeEpoch
 
 			Toggled = not Toggled
 			ModalElement.Modal = Toggled
@@ -54673,6 +54794,8 @@ return LPH_NO_VIRTUALIZE(function()
 			end
 
 			if not Toggled then
+				Library.Interface:Close()
+				Library.Interface:CloseInputs()
 				for _, ColorPicker in next, ColorPickers do
 					ColorPicker:Hide()
 				end
@@ -54690,53 +54813,51 @@ return LPH_NO_VIRTUALIZE(function()
 				end
 			end
 
-			if ShouldFade or not FirstTime then
-				for _, Desc in next, Outer:GetDescendants() do
+			if ShouldFade then
+				local descendants = Outer:GetDescendants()
+				table.insert(descendants, Outer)
+				for _, Desc in next, descendants do
 					local Properties = {}
 
-					if Desc:IsA("ImageLabel") then
+					if Desc:IsA("ImageLabel") or Desc:IsA("ImageButton") then
 						table.insert(Properties, "ImageTransparency")
 						table.insert(Properties, "BackgroundTransparency")
-					elseif Desc:IsA("TextLabel") or Desc:IsA("TextBox") then
+					elseif Desc:IsA("TextLabel") or Desc:IsA("TextBox") or Desc:IsA("TextButton") then
 						table.insert(Properties, "TextTransparency")
+						table.insert(Properties, "BackgroundTransparency")
 					elseif Desc:IsA("Frame") or Desc:IsA("ScrollingFrame") then
 						table.insert(Properties, "BackgroundTransparency")
 					elseif Desc:IsA("UIStroke") then
 						table.insert(Properties, "Transparency")
 					end
 
-					local Cache = TransparencyCache[Desc]
-
-					if not Cache then
-						Cache = {}
-						TransparencyCache[Desc] = Cache
-					end
-
-					for _, Prop in next, Properties do
-						if not Cache[Prop] then
-							Cache[Prop] = Desc[Prop]
+					if #Properties > 0 then
+						local Cache = TransparencyCache[Desc]
+						if not Cache then
+							Cache = {}
+							TransparencyCache[Desc] = Cache
 						end
-
-						if Cache[Prop] == 1 then
-							continue
+						local goals = {}
+						for _, Prop in next, Properties do
+							if Cache[Prop] == nil or (not Toggled and not wasFading) then
+								Cache[Prop] = Desc[Prop]
+							end
+							if Toggled and not wasFading and Desc[Prop] ~= 1 then
+								Desc[Prop] = 1
+							end
+							goals[Prop] = Toggled and Cache[Prop] or 1
 						end
-
-						TweenService:Create(
-							Desc,
-							TweenInfo.new(FadeTime, Enum.EasingStyle.Linear),
-							{ [Prop] = Toggled and Cache[Prop] or 1 }
-						):Play()
+						Library:Animate(Desc, goals, FadeTime)
 					end
 				end
-
-				task.wait(FadeTime)
-
-				FirstTime = true
+				task.delay(FadeTime, function()
+					if epoch ~= fadeEpoch or not Outer.Parent then return end
+					Outer.Visible = Toggled
+					Fading = false
+				end)
+			else
+				Outer.Visible = Toggled
 			end
-
-			Outer.Visible = Toggled
-
-			Fading = false
 		end
 
 		Library:GiveSignal(InputService.InputBegan:Connect(function(Input, Processed)
@@ -54894,6 +55015,8 @@ return function(library)
 		shadow = 100, shadowEnabled = true, shadowSize = 28, glowStrength = 40, glowSize = 16, glowUseAccent = true, glowColor = library.AccentColor, animated = false, effect = "Sweep", speed = 1, gradients = {}, visibleGradients = {}, phase = 0, glow = false }
 	appearance.gradientColor = ColorSequence.new({ ColorSequenceKeypoint.new(0, Color3.new(1, 1, 1)),
 		ColorSequenceKeypoint.new(0.5, Color3.new(0.65, 0.65, 0.65)), ColorSequenceKeypoint.new(1, Color3.new(1, 1, 1)) })
+	appearance.transparency = { BackgroundColor = 0, InnerBoxColor = 0, MainColor = 0 }
+	appearance.surfaces = setmetatable({}, { __mode = "k" })
 	library.Appearance = appearance
 	local originalCreate = library.Create
 	local function textObject(object)
@@ -54911,6 +55034,24 @@ return function(library)
 	end
 	for _, object in ipairs(library.ScreenGui:GetDescendants()) do
 		if textObject(object) then appearance.texts[object] = object.TextSize end
+	end
+
+	function appearance:RegisterSurface(object, key)
+		self.surfaces[object] = key
+		object.BackgroundTransparency = self.transparency[key] or 0
+	end
+	function appearance:SetTransparency(key, value)
+		if self.transparency[key] == nil then return end
+		value = math.clamp(value, 0, 1)
+		if self.transparency[key] == value then return end
+		self.transparency[key] = value
+		for object, category in pairs(self.surfaces) do
+			if category == key and object.Parent then
+				if self.window and self.window.SetSurfaceTransparency then
+					self.window:SetSurfaceTransparency(object, value)
+				else object.BackgroundTransparency = value end
+			end
+		end
 	end
 
 	function appearance:SetFont(name, percent)
@@ -108745,6 +108886,7 @@ function Admin.init()
 end
 
 return Admin
+
 end)
 __bundle_register("Utility/ControlModule", function(require, _LOADED, __bundle_register, __bundle_modules)
 return LPH_NO_VIRTUALIZE(function()
@@ -118973,10 +119115,8 @@ PlayerESP.update = LPH_NO_VIRTUALIZE(function(self)
 
 	self.label = playerName
 
-	local tags = {
-    string.format("[%i/%i] (%i%%)", humanoid.Health or 0, humanoid.MaxHealth or 1, math.floor(((humanoid.Health or 0) / (humanoid.MaxHealth or 1)) * 100)),
-    ESP_POWER:format(level)
-}
+	local showPercent = Configuration.idToggleValue(identifier, "ShowHealthPercent") ~= false
+	local tags = { EntityESP.healthTag(humanoid, showPercent), ESP_POWER:format(level) }
 
 	local dangerTime = humanoid:GetAttribute("DangerExpiration")
 	local dangerTimeLeft = dangerTime and math.ceil(dangerTime - workspace:GetServerTimeNow())
@@ -119105,9 +119245,16 @@ local BAR_ORDER = { HealthBar = 1, ArmorBar = 2, PostureBar = 3, BloodBar = 4, T
 local ELEMENT_PADDING = 1
 local BILLBOARD_MIN_WIDTH = 10
 local BILLBOARD_MIN_HEIGHT = 10
+local DEFAULT_BOX_COLOR = Color3.new(1, 1, 1)
 
 local _textLabelCache = setmetatable({}, { __mode = "k" })
 local _barCache = setmetatable({}, { __mode = "k" })
+
+local function integerOption(identifier, name, default, minimum, maximum)
+	local value = tonumber(Configuration.idOptionValue(identifier, name))
+	if not value or value ~= value or math.abs(value) == math.huge then value = default end
+	return math.clamp(math.floor(value), minimum, maximum)
+end
 
 ---@param frame Frame
 ---@param strokeColor Color3
@@ -119221,7 +119368,8 @@ EntityESP.cgb = LPH_NO_VIRTUALIZE(function(self, container, seperators, vertical
 		background.AnchorPoint = Vector2.new(0, 0)
 	end
 
-	background.BackgroundColor3 = Color3.new(0.0862745, 0.105882, 0.219608)
+	background.BackgroundColor3 = Color3.new(0.06, 0.07, 0.09)
+	background.BackgroundTransparency = 0.15
 	background.BorderSizePixel = 0
 
 	self.gio(background, Color3.new(0, 0, 0), 0)
@@ -119298,7 +119446,8 @@ EntityESP.layoutBar = LPH_NO_VIRTUALIZE(function(self, key, container, defaultSi
 		table.insert(destination, insertAt, element)
 		element.side = side
 	end
-	element.space = vertical and 6 or 3
+	local thickness = integerOption(self.identifier, "BarThickness", 1, 1, 5)
+	element.space = vertical and thickness + 5 or thickness + 2
 
 	local bar = self.gb(container)
 	if not bar then return vertical end
@@ -119322,28 +119471,75 @@ EntityESP.layoutBar = LPH_NO_VIRTUALIZE(function(self, key, container, defaultSi
 		end
 		element.separators = separators
 	end
-	-- Reuse cuts when the slider decreases; the pool never exceeds nineteen frames.
-	for i = #separators + 1, count - 1 do
-		local cut = Instance.new("Frame")
-		cut.Name = "Separator"
-		cut.BackgroundColor3 = Color3.new(0, 0, 0)
-		cut.BorderSizePixel = 0
-		cut.ZIndex = 3
-		cut.Parent = area
-		separators[i] = cut
-	end
 	local segmented = Configuration.idToggleValue(self.identifier, key .. "Segments") ~= false
 	local visible = segmented and distance <= 300
+	-- Create cuts only when enabled, then reuse them when the slider decreases.
+	if visible then
+		for i = #separators + 1, count - 1 do
+			local cut = Instance.new("Frame")
+			cut.Name = "Separator"
+			cut.BackgroundColor3 = Color3.new(0, 0, 0)
+			cut.BorderSizePixel = 0
+			cut.ZIndex = 3
+			cut.Position = vertical and UDim2.new(0, 0, i / count, 0) or UDim2.new(i / count, 0, 0, 0)
+			cut.Size = vertical and UDim2.new(1, 0, 0, 1) or UDim2.new(0, 1, 1, 0)
+			cut.Parent = area
+			separators[i] = cut
+		end
+	end
 	for i, cut in ipairs(separators) do
 		if i < count and (element.vertical ~= vertical or element.segmentCount ~= count) then
 			cut.Position = vertical and UDim2.new(0, 0, i / count, 0) or UDim2.new(i / count, 0, 0, 0)
 			cut.Size = vertical and UDim2.new(1, 0, 0, 1) or UDim2.new(0, 1, 1, 0)
 		end
-		cut.Visible = visible and i < count
+		local shouldShow = visible and i < count
+		if cut.Visible ~= shouldShow then cut.Visible = shouldShow end
 	end
 	element.vertical = vertical
 	element.segmentCount = count
 	return vertical
+end)
+
+-- Corner frames are allocated only if that style is used, and reused on changes.
+EntityESP.updateBox = LPH_NO_VIRTUALIZE(function(self)
+	local enabled = Configuration.idToggleValue(self.identifier, "BoundingBox") == true
+	local style = Configuration.idOptionValue(self.identifier, "BoxStyle") == "Corners" and "Corners" or "Classic"
+	local thickness = integerOption(self.identifier, "BoxThickness", 1, 1, 4)
+	local color = Configuration.idOptionValue(self.identifier, "BoxColor") or DEFAULT_BOX_COLOR
+	local state = self._boxState
+	if state and state.enabled == enabled and state.style == style and state.thickness == thickness and state.color == color then
+		return
+	end
+	self._boxState = { enabled = enabled, style = style, thickness = thickness, color = color }
+	self.bbstroke.Visible = enabled and style == "Classic"
+	self.wbstroke.Visible = enabled and style == "Classic"
+	local stroke = self.wbstroke:FindFirstChildOfClass("UIStroke")
+	if stroke then stroke.Color, stroke.Thickness = color, thickness end
+	local corners = self._boxCorners
+	if enabled and style == "Corners" and not corners then
+		corners = {}
+		for i = 1, 8 do
+			local corner = Instance.new("Frame")
+			corner.Name = "BoxCorner"
+			corner.BorderSizePixel = 1
+			corner.BorderColor3 = Color3.new(0, 0, 0)
+			corner.Parent = self.bbox
+			corners[i] = corner
+		end
+		self._boxCorners = corners
+	end
+	if corners then
+		for i, corner in ipairs(corners) do
+			local right = i > 4
+			local bottom = i % 4 > 2
+			local horizontal = i % 2 == 1
+			corner.AnchorPoint = Vector2.new(right and 1 or 0, bottom and 1 or 0)
+			corner.Position = UDim2.fromScale(right and 1 or 0, bottom and 1 or 0)
+			corner.Size = horizontal and UDim2.new(0.25, 0, 0, thickness) or UDim2.new(0, thickness, 0.25, 0)
+			corner.BackgroundColor3 = color
+			corner.Visible = enabled and style == "Corners"
+		end
+	end
 end)
 
 ---@param self EntityESP
@@ -119374,6 +119570,19 @@ EntityESP.btext = LPH_NO_VIRTUALIZE(function(self, label, tags)
 	end
 
 	return table.concat(lines, "\n"), #lines
+end)
+
+---@param self PlayerESP
+-- Keep the existing health values visible; percentage is an independent option.
+EntityESP.healthTag = LPH_NO_VIRTUALIZE(function(humanoid, showPercent)
+	local health, maximum = humanoid.Health or 0, humanoid.MaxHealth or 0
+	local tag = string.format("[%i/%i]", health, maximum)
+	if showPercent then
+		local ratio = maximum > 0 and health / maximum or 0
+		if ratio ~= ratio then ratio = 0 end
+		tag = tag .. string.format(" (%i%%)", math.floor(math.clamp(ratio, 0, 1) * 100))
+	end
+	return tag
 end)
 
 ---@param self PlayerESP
@@ -119550,14 +119759,11 @@ EntityESP.update = LPH_NO_VIRTUALIZE(function(self, tags)
 
 	self.billboard.Adornee = entityRoot
 
-	local bbstroke = self.bbstroke
-	local wbstroke = self.wbstroke
 	local dcontainer = self.dcontainer
 	local ncontainer = self.ncontainer
 	local hbar = self.hbar
 
-	bbstroke.Visible = Configuration.idToggleValue(identifier, "BoundingBox")
-	wbstroke.Visible = Configuration.idToggleValue(identifier, "BoundingBox")
+	self:updateBox()
 	dcontainer.Visible = Configuration.idToggleValue(identifier, "ShowDistance")
 	hbar.Visible = Configuration.idToggleValue(identifier, "HealthBar")
 
@@ -119872,7 +120078,7 @@ EntityESP.setup = LPH_NO_VIRTUALIZE(function(self)
 	self.bbox = self.maid:mark(espBoundingBox)
 
 	self.hbar = self:add("HealthBar", "left", 6, function(container)
-		self:cgb(container, true, true, Color3.new(1.0, 1.0, 1.0))
+		self:cgb(container, false, true, Color3.new(1.0, 1.0, 1.0))
 	end)
 
 	self:extra()
@@ -119936,12 +120142,13 @@ __bundle_register("Features/Visuals/Objects/MobESP", function(require, _LOADED, 
 ---@module Features.Visuals.Objects.EntityESP
 local EntityESP = require("Features/Visuals/Objects/EntityESP")
 
+---@module Utility.Configuration
+local Configuration = require("Utility/Configuration")
+
 ---@class MobESP: EntityESP
 local MobESP = setmetatable({}, { __index = EntityESP })
 MobESP.__index = MobESP
 MobESP.__type = "MobESP"
-
-local ESP_HEALTH = "[%i/%i]"
 
 ---@param self MobESP
 MobESP.update = LPH_NO_VIRTUALIZE(function(self)
@@ -119954,7 +120161,7 @@ MobESP.update = LPH_NO_VIRTUALIZE(function(self)
 		return self:visible(false)
 	end
 
-	EntityESP.update(self, { ESP_HEALTH:format(humanoid.Health, humanoid.MaxHealth) })
+	EntityESP.update(self, { EntityESP.healthTag(humanoid, Configuration.idToggleValue(self.identifier, "ShowHealthPercent") == true) })
 end)
 
 ---@param identifier string
@@ -121693,7 +121900,7 @@ function Menu.init()
 		Center = true,
 		AutoShow = not shared.Aero.silent,
 		TabPadding = 16,
-		MenuFadeTime = 0.0,
+		MenuFadeTime = 0.15,
 		Size = UDim2.fromOffset(500, 600),
 	})
 
@@ -130532,6 +130739,7 @@ local themes = {
 	},
 }
 local colorKeys = { "BackgroundColor", "InnerBoxColor", "MainColor", "AccentColor", "OutlineColor", "FontColor" }
+local transparencyKeys = { BackgroundColor = true, InnerBoxColor = true, MainColor = true }
 local fonts = { "Gotham", "GothamMedium", "RobotoMono", "Code", "SourceSans", "Arial" }
 local function validName(name)
 	return type(name) == "string" and name:find("%S") and #name <= 80
@@ -130560,7 +130768,11 @@ function ThemeManager:ThemeUpdate()
 	local library = self.Library
 	self.syncing = true
 	for _, key in ipairs(colorKeys) do
-		if Options[key] and Options[key].Value:ToHex() ~= library[key]:ToHex() then Options[key]:SetValueRGB(library[key]) end
+		local transparency = library.Appearance and library.Appearance.transparency[key]
+		if Options[key] and (Options[key].Value:ToHex() ~= library[key]:ToHex()
+			or transparency ~= nil and Options[key].Transparency ~= transparency) then
+			Options[key]:SetValueRGB(library[key], transparency)
+		end
 	end
 	self.syncing = false
 	library.AccentColorDark = library:GetDarkerColor(library.AccentColor)
@@ -130573,6 +130785,8 @@ function ThemeManager:GetCustomTheme()
 	for _, key in ipairs(colorKeys) do data.colors[key] = self.Library[key]:ToHex() end
 	local appearance = self.Library.Appearance
 	if appearance then
+		data.transparency = {}
+		for key in pairs(transparencyKeys) do data.transparency[key] = appearance.transparency[key] end
 		data.font, data.fontSize = appearance.fontName, math.floor(appearance.fontScale * 100 + 0.5)
 		data.shadow, data.animated, data.glow = appearance.shadow, appearance.animated, appearance.glow
 		data.gradientEffect, data.gradientSpeed = appearance.effect, appearance.speed
@@ -130608,6 +130822,13 @@ function ThemeManager:LoadCustomTheme(name)
 		colors[key] = Color3.fromHex(hex)
 	end
 	for key, color in pairs(colors) do self.Library[key] = color end
+	if self.Library.Appearance then
+		for key in pairs(transparencyKeys) do
+			local value = type(data.transparency) == "table" and data.transparency[key]
+			if type(value) ~= "number" or value ~= value or math.abs(value) == math.huge then value = 0 end
+			self.Library.Appearance:SetTransparency(key, value)
+		end
+	end
 	self:ThemeUpdate()
 	local function number(value, fallback, low, high)
 		return type(value) == "number" and value == value and math.clamp(value, low, high) or fallback
@@ -130670,7 +130891,14 @@ function ThemeManager:ApplyToGroupbox(groupbox)
 	local library = self.Library
 	for _, key in ipairs(colorKeys) do
 		local label = key:gsub("(%u)", " %1"):gsub("^ ", "")
-		groupbox:AddLabel(label):AddColorPicker(key, { Title = label, Default = library[key] or library.BackgroundColor, Callback = function(value)
+		local alpha
+		if transparencyKeys[key] and library.Appearance then alpha = library.Appearance.transparency[key] end
+		groupbox:AddLabel(label):AddColorPicker(key, { Title = label, Default = library[key] or library.BackgroundColor,
+			Transparency = alpha,
+			TransparencyCallback = alpha ~= nil and function(value)
+				if not self.syncing then library.Appearance:SetTransparency(key, value) end
+			end or nil,
+			Callback = function(value)
 			if self.syncing then return end
 			library[key] = value
 			self:ThemeUpdate()
@@ -130994,7 +131222,7 @@ local VisualsTab = {}
 function VisualsTab.initESPCustomization(groupbox)
 	groupbox:AddSlider("FontSize", {
 		Text = "ESP Font Size",
-		Default = 16,
+		Default = 13,
 		Min = 4,
 		Max = 24,
 		Rounding = 0,
@@ -131018,7 +131246,7 @@ function VisualsTab.initESPCustomization(groupbox)
 		table.insert(fonts, font.Name)
 	end
 
-	groupbox:AddDropdown("Font", { Text = "ESP Fonts", Default = 1, Values = fonts })
+	groupbox:AddDropdown("Font", { Text = "ESP Fonts", Default = table.find(fonts, "Gotham") or 1, Values = fonts })
 end
 
 ---@param groupbox table
@@ -131379,7 +131607,7 @@ local function addBarLayout(identifier, depbox, toggle, key, label, defaultPosit
 	})
 	local segmented = options:AddToggle(Configuration.identify(identifier, key .. "Segments"), {
 		Text = label .. " Segments",
-		Default = true,
+		Default = false,
 		Tooltip = "Segment cuts are visible within 300 studs.",
 	})
 	local segmentOptions = options:AddDependencyBox()
@@ -131395,28 +131623,55 @@ local function addBarLayout(identifier, depbox, toggle, key, label, defaultPosit
 	options:SetupDependencies({ { toggle, true } })
 end
 
+-- Give controls breathing room below each Player ESP fold header.
+local function playerFold(parent, title)
+	local section = parent:AddCollapsible(title)
+	section:AddBlank(6)
+	return section
+end
+
 ---@param identifier string
 ---@param depbox table
 ---@return string, table
 function VisualsTab.addEntityESP(identifier, depbox)
+	local root = depbox
+	if identifier == "Player" then depbox = playerFold(root, "Health and box") end
 	local hbToggle = depbox:AddToggle(Configuration.identify(identifier, "HealthBar"), {
 		Text = "Show Health Bar",
 		Default = false,
 	})
 
 	hbToggle:AddColorPicker(Configuration.identify(identifier, "FullColor"), {
-		Default = Color3.new(0, 1, 0),
+		Default = Color3.fromRGB(104, 204, 152),
 	})
 
 	hbToggle:AddColorPicker(Configuration.identify(identifier, "EmptyColor"), {
-		Default = Color3.new(1, 0, 0),
+		Default = Color3.fromRGB(224, 105, 105),
 	})
 
 	addBarLayout(identifier, depbox, hbToggle, "HealthBar", "Health Bar", 1)
+	depbox:AddToggle(Configuration.identify(identifier, "ShowHealthPercent"), {
+		Text = "Show Health Percentage",
+		Default = identifier == "Player",
+	})
 
-	depbox:AddToggle(Configuration.identify(identifier, "BoundingBox"), {
+	local boxToggle = depbox:AddToggle(Configuration.identify(identifier, "BoundingBox"), {
 		Text = "Show Bounding Box",
 		Default = false,
+	})
+	boxToggle:AddColorPicker(Configuration.identify(identifier, "BoxColor"), {
+		Default = Color3.new(1, 1, 1),
+	})
+	local boxOptions = depbox:AddDependencyBox()
+	boxOptions:AddDropdown(Configuration.identify(identifier, "BoxStyle"), {
+		Text = "Box Style", Values = { "Classic", "Corners" }, Default = 1,
+	})
+	boxOptions:AddSlider(Configuration.identify(identifier, "BoxThickness"), {
+		Text = "Box Thickness", Default = 1, Min = 1, Max = 4, Rounding = 0,
+	})
+	boxOptions:SetupDependencies({ { boxToggle, true } })
+	depbox:AddSlider(Configuration.identify(identifier, "BarThickness"), {
+		Text = "Bar Thickness", Default = 1, Min = 1, Max = 5, Rounding = 0,
 	})
 
 	depbox:AddToggle(Configuration.identify(identifier, "ShowHealthChanges"), {
@@ -131424,13 +131679,15 @@ function VisualsTab.addEntityESP(identifier, depbox)
 		Default = false,
 	})
 
-	return identifier, depbox
+	return identifier, root
 end
 
 ---@param identifier string
 ---@param depbox table
 ---@return string, table
 function VisualsTab.addPlayerESP(identifier, depbox)
+	local root = depbox
+	depbox = playerFold(root, "Player information")
 	local markAlliesToggle = depbox:AddToggle(Configuration.identify(identifier, "MarkAllies"), {
 		Text = "Mark Allies",
 		Default = false,
@@ -131485,6 +131742,12 @@ function VisualsTab.addPlayerESP(identifier, depbox)
 		Text = "Show Danger Time",
 		Default = false,
 	})
+	depbox:AddDropdown(Configuration.identify(identifier, "PlayerNameType"), {
+		Text = "Player Name Type",
+		Default = 1,
+		Values = { "Character Name", "Roblox Display Name", "Roblox Username" },
+	})
+	depbox = playerFold(root, "Player bars")
 
 	local armorBar = depbox:AddToggle(Configuration.identify(identifier, "ArmorBar"), {
 		Text = "Show Armor Bar",
@@ -131492,7 +131755,7 @@ function VisualsTab.addPlayerESP(identifier, depbox)
 	})
 
 	armorBar:AddColorPicker(Configuration.identify(identifier, "ArmorBarColor"), {
-		Default = Color3.new(0.388235, 0.686274, 0.984313),
+		Default = Color3.fromRGB(119, 172, 221),
 	})
 	addBarLayout(identifier, depbox, armorBar, "ArmorBar", "Armor Bar", 1)
 
@@ -131502,7 +131765,7 @@ function VisualsTab.addPlayerESP(identifier, depbox)
 	})
 
 	bloodBar:AddColorPicker(Configuration.identify(identifier, "BloodBarColor"), {
-		Default = Color3.new(0.8, 0, 0),
+		Default = Color3.fromRGB(198, 92, 100),
 	})
 	addBarLayout(identifier, depbox, bloodBar, "BloodBar", "Blood Bar", 3)
 
@@ -131512,7 +131775,7 @@ function VisualsTab.addPlayerESP(identifier, depbox)
 	})
 
 	sanityBar:AddColorPicker(Configuration.identify(identifier, "SanityBarColor"), {
-		Default = Color3.new(0.6, 0, 0.8),
+		Default = Color3.fromRGB(167, 125, 205),
 	})
 	addBarLayout(identifier, depbox, sanityBar, "SanityBar", "Sanity Bar", 3)
 
@@ -131522,7 +131785,7 @@ function VisualsTab.addPlayerESP(identifier, depbox)
 	})
 
 	tempoBar:AddColorPicker(Configuration.identify(identifier, "TempoBarColor"), {
-		Default = Color3.new(0, 1, 1),
+		Default = Color3.fromRGB(103, 196, 199),
 	})
 	addBarLayout(identifier, depbox, tempoBar, "TempoBar", "Tempo Bar", 3)
 
@@ -131532,17 +131795,11 @@ function VisualsTab.addPlayerESP(identifier, depbox)
 	})
 
 	postureBar:AddColorPicker(Configuration.identify(identifier, "PostureBarColor"), {
-		Default = Color3.new(1, 0.8, 0),
+		Default = Color3.fromRGB(220, 187, 98),
 	})
 	addBarLayout(identifier, depbox, postureBar, "PostureBar", "Posture Bar", 3)
 
-	depbox:AddDropdown(Configuration.identify(identifier, "PlayerNameType"), {
-		Text = "Player Name Type",
-		Default = 1,
-		Values = { "Character Name", "Roblox Display Name", "Roblox Username" },
-	})
-
-	return identifier, depbox
+	return identifier, root
 end
 
 ---@param identifier string
