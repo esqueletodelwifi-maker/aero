@@ -46,6 +46,9 @@ if not shared then
 	return
 end
 
+-- GetService is unavailable inside a fixed-simulation callback. Only this
+-- specific startup context needs a handoff to the next Heartbeat.
+local function start(players)
 -- Quiet by default: state remains inspectable even if initialization yields.
 -- The separate diagnostic executable opts into console output for one launch.
 local startupEnvironment = getgenv and getgenv() or getfenv()
@@ -71,7 +74,7 @@ task.delay(15, function()
 end)
 
 local services = {
-	Players = game:GetService("Players"),
+	Players = players,
 	CollectionService = game:GetService("CollectionService"),
 }
 
@@ -167,6 +170,38 @@ end
 Profiler.run("Main_InitializeScript", function(...)
 	return xpcall(initializeScript, onInitializeError, ...)
 end)
+
+end
+
+local function findPlayers()
+	return game:GetService("Players")
+end
+
+local ok, players = pcall(findPlayers)
+if ok then
+	return start(players)
+end
+
+if not tostring(players):find("not allowed for simulation callbacks", 1, true) then
+	error(players, 0)
+end
+
+local environment = getgenv and getgenv() or getfenv()
+if environment.AeroSimulationStartupPending then return end
+environment.AeroSimulationStartupPending = true
+local scheduled, schedulingError = pcall(task.delay, 0, function()
+	environment.AeroSimulationStartupPending = nil
+	local retryOk, retryPlayers = pcall(findPlayers)
+	if not retryOk then
+		warn("[Aero] Could not start outside the simulation callback: " .. tostring(retryPlayers))
+		return
+	end
+	start(retryPlayers)
+end)
+if not scheduled then
+	environment.AeroSimulationStartupPending = nil
+	warn("[Aero] Could not schedule startup outside the simulation callback: " .. tostring(schedulingError))
+end
 
 end)
 __bundle_register("Aero", function(require, _LOADED, __bundle_register, __bundle_modules)
@@ -407,6 +442,7 @@ function Aero.init()
 		end
 	end
 
+	if game.PlaceId ~= LOBBY_PLACE_ID and PersistentData.get("shslot") then ServerHop.arrived() end
 	PersistentData.set("shslot", nil)
 
 	if game.PlaceId == DEPTHS_PLACE_ID then
@@ -50116,6 +50152,10 @@ return LPH_NO_VIRTUALIZE(function()
 	end
 
 	function Library:SafeCallback(label, f, ...)
+		local id = label:match("^Toggle_Callback_(.+)$") or label:match("^Slider_Callback_(.+)$")
+			or label:match("^Dropdown_Callback_(.+)$") or label:match("^Textbox_Callback_(.+)$")
+			or label:match("^ColorPicker_Callback_(.+)$") or label:match("^KeyPicker_ChangedCallback_(.+)$")
+		if id and Library.ConfigTracker then Library.ConfigTracker:OptionChanged(id) end
 		if not f then
 			return
 		end
@@ -50342,6 +50382,7 @@ return LPH_NO_VIRTUALIZE(function()
 
 	function Library:MakeDraggable(Frame, Cutoff)
 		self.Interface:BindDrag(Frame, Cutoff or 40)
+		if self.Cursor then self.Cursor:WatchWidget(Frame) end
 	end
 
 	function Library:AddToolTip(InfoStr, HoverInstance)
@@ -50937,7 +50978,7 @@ return LPH_NO_VIRTUALIZE(function()
 				return swatch
 			end
 			local previousPreview, currentPreview = colorPreview("PreviousColor", 186), colorPreview("CurrentColor", 212)
-			for _, item in ipairs({ { "Antes", 182 }, { "Ahora", 208 } }) do
+			for _, item in ipairs({ { "Old", 182 }, { "New", 208 } }) do
 				Library:CreateLabel({ Text = item[1], TextSize = 8, TextTransparency = 0.35,
 					Position = UDim2.fromOffset(item[2], 4), Size = UDim2.fromOffset(28, 10),
 					ZIndex = 19, Parent = PickerFrameInner })
@@ -51497,6 +51538,7 @@ return LPH_NO_VIRTUALIZE(function()
 				Parent = Library.KeybindContainer,
 			}, true)
 
+			local PickerIndex = Idx
 			local Modes = Info.Modes or { "Always", "Toggle", "Hold", "Off" }
 			local ModeButtons = {}
 			ModeSelectOuter.Size = UDim2.fromOffset(94, (#Modes + 1) * 22)
@@ -51559,6 +51601,7 @@ return LPH_NO_VIRTUALIZE(function()
 				Label.InputBegan:Connect(function(Input)
 					if Input.UserInputType == Enum.UserInputType.MouseButton1 then
 						ModeButton:Select()
+						if PickerIndex and Library.ConfigTracker then Library.ConfigTracker:OptionChanged(PickerIndex) end
 						Library:AttemptSave()
 					end
 				end)
@@ -51630,6 +51673,7 @@ return LPH_NO_VIRTUALIZE(function()
 				KeyPicker.Value = Key
 				ModeButtons[Mode]:Select()
 				KeyPicker:Update()
+				if PickerIndex and Library.ConfigTracker then Library.ConfigTracker:OptionChanged(PickerIndex) end
 			end
 
 			function KeyPicker:Unbind()
@@ -53402,6 +53446,8 @@ return LPH_NO_VIRTUALIZE(function()
 		function Funcs:AddCollapsible(Text)
 			local Parent = self
 			local Section = { Name = Parent.Name, OwnerTab = Parent.OwnerTab, Expanded = false, IsDependency = Parent.IsDependency }
+			local foldId = tostring(Parent.OwnerTab and Parent.OwnerTab.Name or "") .. "/" .. tostring(Parent.Name) .. "/" .. Text
+			Library.Interface.folds[foldId] = Section
 			local Header = Library:Create("TextButton", {
 				Text = Text, AutoButtonColor = false, TextXAlignment = Enum.TextXAlignment.Left,
 				FontFace = Library.Font, TextSize = 11, TextColor3 = Library.FontColor,
@@ -53436,6 +53482,7 @@ return LPH_NO_VIRTUALIZE(function()
 				Parent:Resize()
 			end
 			function Section:SetExpanded(value)
+				local changed = self.Expanded ~= (value == true)
 				self.Expanded = value == true
 				Holder.Visible = self.Expanded
 				SetExpandedBorder(self.Expanded)
@@ -53444,6 +53491,7 @@ return LPH_NO_VIRTUALIZE(function()
 				if not self.Expanded then Library.Interface:CloseInputs() end
 				self:Resize()
 				if Library.Appearance then Library.Appearance:QueueVisible() end
+				if changed and Library.ConfigTracker then Library.ConfigTracker:FoldChanged(foldId, self.Expanded) end
 			end
 			function Section:Show()
 				local reveal = Parent.SearchSection or Parent
@@ -54086,8 +54134,14 @@ return LPH_NO_VIRTUALIZE(function()
 			BorderColor3 = "OutlineColor",
 		})
 
+		local windowTitle, configDirty = Config.Title, false
 		function Window:SetWindowTitle(Title)
-			WindowLabel.Text = Title
+			windowTitle = Title
+			WindowLabel.Text = windowTitle .. (configDirty and " *" or "")
+		end
+		function Window:SetConfigDirty(dirty)
+			configDirty = dirty == true
+			WindowLabel.Text = windowTitle .. (configDirty and " *" or "")
 		end
 
 		---Add a tab to the window.
@@ -54361,6 +54415,7 @@ return LPH_NO_VIRTUALIZE(function()
 			local CategoryBar
 			local CategoryLine
 			local CategoryButtons = {}
+			local CategoryHeight = 30
 			local function moveCategoryIndicator(animate)
 				local selected = Tab.Categories[Tab.ActiveCategory]
 				if not selected then return end
@@ -54383,7 +54438,7 @@ return LPH_NO_VIRTUALIZE(function()
 				CategoryLine.Visible = true
 			end
 			local function layoutCategories()
-				local top = 7 + HeaderHeight + (CategoryBar and ControlHeight + 6 or 0)
+				local top = 7 + HeaderHeight + (CategoryBar and CategoryHeight + 8 or 0)
 				for _, side in ipairs({ LeftSide, RightSide }) do
 					side.Position = UDim2.new(side.Position.X.Scale, side.Position.X.Offset, 0, top)
 					side.Size = UDim2.new(side.Size.X.Scale, side.Size.X.Offset, 1, -top - 7)
@@ -54416,24 +54471,34 @@ return LPH_NO_VIRTUALIZE(function()
 
 			function Tab:AddCategory(Name)
 				if not CategoryBar then
-					CategoryBar = Library:Create("Frame", { Name = "Categories", BackgroundTransparency = 1,
-						Size = UDim2.new(1, -14, 0, ControlHeight), Parent = TabFrame })
+					CategoryBar = Library:Create("Frame", { Name = "Categories", BackgroundColor3 = Library.InnerBoxColor,
+						BorderColor3 = Library.OutlineColor, BackgroundTransparency = 0.24,
+						Size = UDim2.new(1, -14, 0, CategoryHeight), ZIndex = 3, Parent = TabFrame })
+					Library:AddToRegistry(CategoryBar, { BackgroundColor3 = "InnerBoxColor", BorderColor3 = "OutlineColor" })
+					Library:StyleSurface(CategoryBar, 6, 0.65)
 					CategoryLine = Library:Create("Frame", { Name = "ActiveCategoryLine", BackgroundColor3 = Library.AccentColor,
 						BorderSizePixel = 0, Size = UDim2.fromOffset(0, 2), Visible = false, ZIndex = 6, Parent = CategoryBar })
 					Library:AddToRegistry(CategoryLine, { BackgroundColor3 = "AccentColor" })
 					Tab.CategoryIndicator = CategoryLine
+					if Library.Appearance then Library.Appearance:AddGradient(CategoryLine) end
 					layoutCategories()
 				end
 				local Category = { Name = Name, Boxes = {}, Count = 0, Scroll = { left = Vector2.zero, right = Vector2.zero } }
-				local Button = Library:Create("TextButton", { Text = Name, FontFace = Library.Font, TextSize = 13,
+				local Button = Library:Create("TextButton", { Name = "CategoryButton", Text = Name, FontFace = Library.Font, TextSize = 12,
 					TextColor3 = Library.FontColor, AutoButtonColor = false, BackgroundColor3 = Library.MainColor,
-					BackgroundTransparency = 1, BorderSizePixel = 0, TextTransparency = 0.4,
+					BackgroundTransparency = 1, BorderSizePixel = 0, TextTransparency = 0.35,
 					BorderColor3 = Library.OutlineColor, ZIndex = 5, Parent = CategoryBar })
 				Library:AddToRegistry(Button, { TextColor3 = "FontColor", BackgroundColor3 = "MainColor", BorderColor3 = "OutlineColor" })
+				Library:StyleSurface(Button, 5, 0.7)
 				Category.Button = Button
 				Category.SetActiveBorder = Library:BindControlBorder(Button)
-				Button.MouseEnter:Connect(function() Library:Animate(Button, { TextTransparency = 0 }) end)
-				Button.MouseLeave:Connect(function() Library:Animate(Button, { TextTransparency = Tab.ActiveCategory == Name and 0 or 0.4 }) end)
+				Button.MouseEnter:Connect(function()
+					Library:Animate(Button, { TextTransparency = 0, BackgroundTransparency = Tab.ActiveCategory == Name and 0.08 or 0.55 }, 0.12)
+				end)
+				Button.MouseLeave:Connect(function()
+					local active = Tab.ActiveCategory == Name
+					Library:Animate(Button, { TextTransparency = active and 0 or 0.35, BackgroundTransparency = active and 0.08 or 1 }, 0.12)
+				end)
 				function Category:Show(skipScrollRestore)
 					if Tab.ActiveCategory ~= Name then
 						local previous = Tab.Categories[Tab.ActiveCategory]
@@ -54446,7 +54511,8 @@ return LPH_NO_VIRTUALIZE(function()
 							local color = key == Name and "AccentColor" or "FontColor"
 							item.Button.TextColor3 = Library[color]
 							Library.RegistryMap[item.Button].Properties.TextColor3 = color
-							Library:Animate(item.Button, { TextTransparency = key == Name and 0 or 0.4 })
+							Library:Animate(item.Button, { TextTransparency = key == Name and 0 or 0.35,
+								BackgroundTransparency = key == Name and 0.08 or 1 }, 0.14)
 						end
 						moveCategoryIndicator(true)
 						local scroll = self.Scroll
@@ -54738,6 +54804,7 @@ return LPH_NO_VIRTUALIZE(function()
 
 			TabButton.InputBegan:Connect(function(Input)
 				if Input.UserInputType == Enum.UserInputType.MouseButton1 then
+					Window.UserTabIntent = true
 					Tab:ShowTab()
 				end
 			end)
@@ -54866,12 +54933,14 @@ return LPH_NO_VIRTUALIZE(function()
 					Input.UserInputType == Enum.UserInputType.Keyboard
 					and Input.KeyCode.Name == Library.ToggleKeybind.Value
 				then
+					Window.UserTabIntent = true
 					task.spawn(Library.Toggle)
 				end
 			elseif
 				Input.KeyCode == Enum.KeyCode.RightControl
 				or (Input.KeyCode == Enum.KeyCode.RightShift and not Processed)
 			then
+				Window.UserTabIntent = true
 				task.spawn(Library.Toggle)
 			end
 		end))
@@ -54905,10 +54974,101 @@ return LPH_NO_VIRTUALIZE(function()
 
 	require("GUI/Appearance")(Library)
 	require("GUI/Notifications")(Library, Options)
+	require("GUI/Cursor")(Library, CoreGuiManager)
+	for _,frame in ipairs({Library.Watermark, Library.InfoLoggerFrame, Library.KeybindFrame}) do
+		Library.Cursor:WatchWidget(frame)
+	end
 
 	getgenv().Library = Library
 	return Library
 end)()
+
+end)
+__bundle_register("GUI/Cursor", function(require, _LOADED, __bundle_register, __bundle_modules)
+-- High-layer cursor for Aero's menu and draggable widgets; idle when they are not in use.
+return function(library, coreGuiManager)
+ local input=game:GetService("UserInputService")
+ local gui=coreGuiManager.imark(Instance.new("ScreenGui"))
+ gui.Name="AeroCursor";gui.IgnoreGuiInset=true;gui.ResetOnSpawn=false;gui.DisplayOrder=100001;gui.Enabled=false
+ gui.ZIndexBehavior=Enum.ZIndexBehavior.Global
+ local arrow=library:Create("Frame",{Name="Pointer",BackgroundTransparency=1,BorderSizePixel=0,
+  Size=UDim2.fromOffset(18,22),ZIndex=1,Parent=gui})
+ -- Small pixel arrow: black edge and white interior, with no external image dependency.
+ for y=0,13 do
+  local width=math.floor(y*0.72)+3
+  library:Create("Frame",{BackgroundColor3=Color3.new(0,0,0),BorderSizePixel=0,
+   Position=UDim2.fromOffset(0,y),Size=UDim2.fromOffset(width,1),ZIndex=2,Parent=arrow})
+  if y>1 and width>3 then library:Create("Frame",{BackgroundColor3=Color3.new(1,1,1),BorderSizePixel=0,
+   Position=UDim2.fromOffset(1,y),Size=UDim2.fromOffset(width-2,1),ZIndex=3,Parent=arrow}) end
+ end
+ library:Create("Frame",{BackgroundColor3=Color3.new(0,0,0),BorderSizePixel=0,
+  Position=UDim2.fromOffset(6,11),Size=UDim2.fromOffset(5,9),Rotation=-25,ZIndex=2,Parent=arrow})
+ library:Create("Frame",{BackgroundColor3=Color3.new(1,1,1),BorderSizePixel=0,
+  Position=UDim2.fromOffset(7,11),Size=UDim2.fromOffset(3,8),Rotation=-25,ZIndex=3,Parent=arrow})
+ local pointer={gui=gui,arrow=arrow,widgets=setmetatable({}, {__mode="k"})}
+ local watched=setmetatable({}, {__mode="k"})
+ local connections={}
+ local moving,priorIcon,alive=nil,nil,true
+ local function connect(signal,fn) local c=signal:Connect(fn);connections[#connections+1]=c;return c end
+ local function effectiveVisible(frame)
+  local node=frame
+  while node do
+   if (node:IsA("GuiObject") and not node.Visible) or (node:IsA("ScreenGui") and node.Enabled==false) then return false end
+   node=node.Parent
+  end
+  return frame.Parent~=nil
+ end
+ local function place()
+  local point=input:GetMouseLocation();arrow.Position=UDim2.fromOffset(point.X,point.Y)
+ end
+ local function update()
+  if not alive then return end
+  local active=pointer.menu and effectiveVisible(pointer.menu) or false
+  if not active then for frame,hover in pairs(pointer.widgets) do if hover and effectiveVisible(frame) then active=true;break end end end
+  active=active and input.MouseEnabled~=false
+  if active and not gui.Enabled then
+   priorIcon=input.MouseIconEnabled;input.MouseIconEnabled=false
+   gui.Enabled=true;place()
+   moving=input.InputChanged:Connect(function(event) if event.UserInputType==Enum.UserInputType.MouseMovement then place() end end)
+  elseif not active and gui.Enabled then
+   gui.Enabled=false
+   if moving then moving:Disconnect();moving=nil end
+   if input.MouseIconEnabled==false and priorIcon~=nil then input.MouseIconEnabled=priorIcon end
+   priorIcon=nil
+  end
+ end
+ function pointer:WatchMenu(frame)
+  self.menu=frame
+  connect(frame:GetPropertyChangedSignal("Visible"),update)
+  connect(library.ScreenGui:GetPropertyChangedSignal("Enabled"),update)
+  update()
+ end
+ function pointer:WatchWidget(frame)
+  if watched[frame] then return end
+  watched[frame]=true;self.widgets[frame]=false
+  connect(frame.MouseEnter,function() self.widgets[frame]=true;update() end)
+  connect(frame.MouseLeave,function() self.widgets[frame]=false;update() end)
+  connect(frame:GetPropertyChangedSignal("Visible"),function() if not frame.Visible then self.widgets[frame]=false end;update() end)
+  local node=frame.Parent
+  while node do
+   if node:IsA("ScreenGui") then
+    local screen=node
+    connect(screen:GetPropertyChangedSignal("Enabled"),function() if not screen.Enabled then self.widgets[frame]=false end;update() end)
+    break
+   end
+   node=node.Parent
+  end
+ end
+ library:GiveSignal({Disconnect=function()
+  if not alive then return end
+  pointer.menu=nil;table.clear(pointer.widgets);update();alive=false
+  if moving then moving:Disconnect();moving=nil end
+  for _,connection in ipairs(connections) do connection:Disconnect() end
+  gui:Destroy()
+ end})
+ library.Cursor=pointer
+ return pointer
+end
 
 end)
 __bundle_register("GUI/Notifications", function(require, _LOADED, __bundle_register, __bundle_modules)
@@ -55074,11 +55234,16 @@ return function(library)
 		return gradient
 	end
 	function appearance:QueueVisible()
+		if not self.animated or not self.window or not self.window.Holder.Visible then
+			self.visibleGradients = {}
+			return
+		end
 		if self.queued then return end
 		self.queued = true
 		task.defer(function()
 			self.queued = false
 			self.visibleGradients = {}
+			if not self.animated or not self.window or not self.window.Holder.Visible then return end
 			for _, gradient in ipairs(self.gradients) do
 				local object = gradient.Parent
 				local visible, parent, inWindow = object ~= nil and gradient.Enabled, object, false
@@ -55166,7 +55331,10 @@ return function(library)
 		layers("MenuGlow", self.glows)
 		self.outline = library:Create("UIStroke", { Name = "EdgeGlow", Thickness = 1, Transparency = 0.45,
 			Color = library.AccentColor, Enabled = false, Parent = window.Holder })
-		self.visible = window.Holder:GetPropertyChangedSignal("Visible"):Connect(function() self:Update() end)
+		self.visible = window.Holder:GetPropertyChangedSignal("Visible"):Connect(function()
+			self:QueueVisible()
+			self:UpdateAnimation()
+		end)
 		library:GiveSignal(self.visible)
 		self:Update()
 	end
@@ -55275,7 +55443,7 @@ return function(library)
 	local input = game:GetService("UserInputService")
 	local runService = game:GetService("RunService")
 	local guiService = game:GetService("GuiService")
-	local interface = { entries = {}, order = {}, closers = {}, epoch = 0, notificationHistory = {}, unreadNotifications = 0 }
+	local interface = { entries = {}, order = {}, closers = {}, folds = {}, epoch = 0, notificationHistory = {}, unreadNotifications = 0 }
 	library.Interface = interface
 	library.ScaledObjects = setmetatable({}, { __mode = "k" })
 	library.DragBlockers = setmetatable({}, { __mode = "k" })
@@ -55313,12 +55481,20 @@ return function(library)
 		interface:FitWindow()
 	end
 
-	function library:IsOverDragBlocker(point)
+	function library:IsOverDragBlocker(point, scope)
 		point = point or input:GetMouseLocation() - screenOrigin()
 		for frame in pairs(self.DragBlockers) do
 			if frame.Parent and frame.Visible then
-				local p, s = frame.AbsolutePosition, frame.AbsoluteSize
-				if point.X >= p.X and point.X <= p.X + s.X and point.Y >= p.Y and point.Y <= p.Y + s.Y then return true end
+				local visible, inScope, node = true, scope == nil or frame == scope, frame.Parent
+				while node do
+					if node == scope then inScope=true end
+					if (node:IsA("GuiObject") and not node.Visible) or (node:IsA("ScreenGui") and node.Enabled == false) then visible=false;break end
+					node=node.Parent
+				end
+				if visible and inScope then
+					local p, s = frame.AbsolutePosition, frame.AbsoluteSize
+					if point.X >= p.X and point.X <= p.X + s.X and point.Y >= p.Y and point.Y <= p.Y + s.Y then return true end
+				end
 			end
 		end
 		return false
@@ -55352,7 +55528,7 @@ return function(library)
 			if self.drag or self.resize or not frame.Visible then return end
 			local touch = event.UserInputType == Enum.UserInputType.Touch and event or nil
 			local point = touch and (Vector2.new(event.Position.X, event.Position.Y) - screenOrigin()) or input:GetMouseLocation() - screenOrigin()
-			if frame == self.outer and library:IsOverDragBlocker(point) then return end
+			if (frame == self.outer and library:IsOverDragBlocker(point)) or library:IsOverDragBlocker(point, frame) then return end
 			local p, size = frame.AbsolutePosition, frame.AbsoluteSize
 			local scale = frame:FindFirstChild("AeroUIScale") and library.UIScale or 1
 			if point.Y < p.Y or point.Y > p.Y + cutoff * scale then return end
@@ -55432,6 +55608,7 @@ return function(library)
 
 	function interface:Focus(entry)
 		local section = entry.groupbox
+		if self.window then self.window.UserTabIntent = true end
 		section.OwnerTab:ShowTab()
 		local reveal = section.SearchSection or section
 		if reveal.Show then reveal:Show() end
@@ -55683,8 +55860,9 @@ return function(library)
 
 	function interface:Attach(window, outer)
 		self:EndResize(true)
-		self.rows, self.resultCount = {}, 0
+		self.rows, self.resultCount, self.folds = {}, 0, {}
 		self.window, self.outer = window, outer
+		if library.Cursor then library.Cursor:WatchMenu(outer) end
 		library:AddUIScale(outer)
 		self.search = library:Create("TextBox", {
 			Name = "GlobalSearch", Text = "", PlaceholderText = "Search...", ClearTextOnFocus = false,
@@ -55856,22 +56034,25 @@ return function(library)
 	function library:GetInterfaceState()
 		local window, outer = interface.window, interface.outer
 		if not window then return nil end
-		local subtabs, scroll, categories = {}, {}, {}
+		local subtabs, scroll, categories, folds = {}, {}, {}, {}
 		for id, box in pairs(window.Tabboxes) do subtabs[id] = box.ActiveTab end
+		for id, section in pairs(interface.folds) do folds[id] = section.Expanded end
 		for name, tab in pairs(window.Tabs) do
 			scroll[name] = { left = tab.LeftSide.CanvasPosition.Y, right = tab.RightSide.CanvasPosition.Y }
 			categories[name] = tab.ActiveCategory
 		end
-		return { version = 1, scale = self.UIScale, subtabs = subtabs, scroll = scroll, categories = categories,
+		return { version = 1, scale = self.UIScale, subtabs = subtabs, scroll = scroll, categories = categories, folds = folds,
 			selectedTab = window.SelectedTab, window = { width = outer.Size.X.Offset, height = outer.Size.Y.Offset,
 				position = { xScale = outer.Position.X.Scale, xOffset = outer.Position.X.Offset,
 					yScale = outer.Position.Y.Scale, yOffset = outer.Position.Y.Offset },
 				anchor = { x = outer.AnchorPoint.X, y = outer.AnchorPoint.Y } } }
 	end
 
-	function library:ApplyInterfaceState(value)
+	function library:ApplyInterfaceState(value, preserveSelectedTab)
 		local state = Model.layout(value)
 		if not state or not interface.window then return end
+		-- Startup autoload may finish after the user has already opened or navigated the menu.
+		if preserveSelectedTab then state.selectedTab = nil end
 		local aliases = { ESP = "Visuals", Utility = "Game", Config = "Settings" }
 		state.selectedTab = aliases[state.selectedTab] or state.selectedTab
 		interface.epoch = interface.epoch + 1
@@ -55884,6 +56065,10 @@ return function(library)
 		end
 		outer.Size = UDim2.fromOffset(state.width or outer.Size.X.Offset, state.height or outer.Size.Y.Offset)
 		self:SetUIScale(state.scale)
+		for key, expanded in pairs(state.folds) do
+			local section = interface.folds[key]
+			if section then section:SetExpanded(expanded) end
+		end
 		for key, name in pairs(state.subtabs) do
 			local box = window.Tabboxes[key]
 			if box and box.Tabs[name] then box.Tabs[name]:Show() end
@@ -55944,7 +56129,7 @@ end
 
 function Model.layout(value)
 	if type(value) ~= "table" or value.version ~= 1 then return nil end
-	local result = { version = 1, subtabs = {}, scroll = {}, categories = {} }
+	local result = { version = 1, subtabs = {}, scroll = {}, categories = {}, folds = {} }
 	result.scale = bounded(value.scale, 0.65, 1.5) or 1
 	if type(value.window) == "table" then
 		local window = value.window
@@ -55971,6 +56156,11 @@ function Model.layout(value)
 	if type(value.categories) == "table" then
 		for id, name in pairs(value.categories) do
 			if type(id) == "string" and type(name) == "string" then result.categories[id] = name end
+		end
+	end
+	if type(value.folds) == "table" then
+		for id, expanded in pairs(value.folds) do
+			if type(id) == "string" and type(expanded) == "boolean" then result.folds[id] = expanded end
 		end
 	end
 	if type(value.scroll) == "table" then
@@ -59850,6 +60040,11 @@ local lastRetry = nil
 local currentSlot = nil
 local currentServerId = nil
 local currentServerSince = nil
+local selectionMode = "Small"
+local targetServerId = nil
+local lobbyStarted = nil
+local hopConnection = nil
+local failureConnection = nil
 
 local function telemetryLog(...)
 	if not DEBUGGING_MODE then
@@ -60004,6 +60199,16 @@ local function advanceServer(reason)
 	currentServerSince = nil
 end
 
+local function stopTargetHop(reason)
+	Logger.longNotify("Serverhop: %s", reason)
+	if hopConnection then hopConnection:Disconnect(); hopConnection = nil end
+	if failureConnection then failureConnection:Disconnect(); failureConnection = nil end
+	PersistentData.set("shslot", nil)
+	PersistentData.set("shtarget", nil)
+	PersistentData.set("shmode", nil)
+	PersistentData.set("shorigin", nil)
+end
+
 local function updateServerHopping()
 	-- Throttle to once a second.
 	if lastRetry and os.clock() - lastRetry <= 1.0 then
@@ -60011,6 +60216,10 @@ local function updateServerHopping()
 	end
 
 	lastRetry = os.clock()
+	if targetServerId and os.clock() - lobbyStarted >= 30 then
+		stopTargetHop("Target server unavailable or timed out. Reload Aero to try again.")
+		return
+	end
 
 	-- No servers listed yet -- press the slot button to select it and populate the list.
 	local buttons = serverButtons()
@@ -60023,7 +60232,7 @@ local function updateServerHopping()
 	local blacklist = getBlacklist()
 	local candidates = {}
 	for _, server in ipairs(buttons) do
-		if not blacklist[server.id] then
+		if (targetServerId and server.id == targetServerId) or (not targetServerId and not blacklist[server.id]) then
 			candidates[#candidates + 1] = server
 		end
 	end
@@ -60038,11 +60247,14 @@ local function updateServerHopping()
 		if first.players == second.players then
 			return first.id < second.id
 		end
+		if first.players == UNKNOWN_PLAYER_COUNT then return false end
+		if second.players == UNKNOWN_PLAYER_COUNT then return true end
+		if selectionMode == "Large" then return first.players > second.players end
 		return first.players < second.players
 	end)
 
 	-- Drop a target that got blacklisted since we picked it.
-	if currentServerId and blacklist[currentServerId] then
+	if not targetServerId and currentServerId and blacklist[currentServerId] then
 		currentServerId = nil
 	end
 
@@ -60058,6 +60270,10 @@ local function updateServerHopping()
 
 	-- Current target hasn't taken us in time -- blacklist it and move on.
 	if currentServerSince and os.clock() - currentServerSince >= SERVER_SWITCH_TIMEOUT then
+		if targetServerId then
+			stopTargetHop("Target server did not respond. Reload Aero to try again.")
+			return
+		end
 		advanceServer("Not joined in time")
 		return
 	end
@@ -60080,7 +60296,11 @@ end
 
 local function onTeleportFailure(...)
 	-- A full server (or other teleport failure) -- blacklist it and switch.
-	advanceServer("Teleport failed")
+	if targetServerId then
+		stopTargetHop("Could not join the target server. Reload Aero to try again.")
+	else
+		advanceServer("Teleport failed")
+	end
 end
 
 function ServerHop.lobby()
@@ -60093,12 +60313,16 @@ function ServerHop.lobby()
 	currentServerId = nil
 	currentServerSince = nil
 	lastRetry = nil
+	selectionMode = PersistentData.get("shmode") == "Large" and "Large" or "Small"
+	targetServerId = PersistentData.get("shtarget")
+	lobbyStarted = os.clock()
+	if hopConnection then hopConnection:Disconnect() end
+	if failureConnection then failureConnection:Disconnect() end
 
 	telemetryLog("(%s) Picking a server by pressing the menu buttons.", tostring(shslot))
 
-	teleportService.TeleportInitFailed:Connect(onTeleportFailure)
-
-	runService.PreRender:Connect(updateServerHopping)
+	failureConnection = teleportService.TeleportInitFailed:Connect(onTeleportFailure)
+	hopConnection = runService.PreRender:Connect(updateServerHopping)
 end
 
 function ServerHop.rlobby()
@@ -60124,7 +60348,17 @@ end
 
 ---@param slot string The data slot to use.
 ---@param blacklist boolean If true, blacklist the current server.
-function ServerHop.hop(slot, blacklist)
+function ServerHop.hop(slot, blacklist, mode, target)
+	if target ~= nil and (type(target) ~= "string" or target == "") then
+		return error("A server ID is required.")
+	end
+	PersistentData.set("shmode", mode == "Large" and "Large" or "Small")
+	PersistentData.set("shtarget", target)
+	if game.PlaceId ~= LOBBY_PLACE_ID and type(game.JobId) == "string" and game.JobId ~= "" then
+		PersistentData.set("shorigin", game.JobId)
+	else
+		PersistentData.set("shorigin", nil)
+	end
 	PersistentData.set("shslot", slot)
 
 	telemetryLog("(%s, %s) Hopping to new server.", tostring(slot), tostring(blacklist))
@@ -60143,6 +60377,17 @@ function ServerHop.hop(slot, blacklist)
 	end
 
 	return ServerHop.rlobby()
+end
+
+-- Record the departed server only once a different game server has actually loaded.
+function ServerHop.arrived()
+	local origin = PersistentData.get("shorigin")
+	if PersistentData.get("shslot") and type(origin) == "string" and origin ~= "" and type(game.JobId) == "string" and game.JobId ~= "" and game.JobId ~= origin then
+		PersistentData.set("shprevious", origin)
+	end
+	PersistentData.set("shorigin", nil)
+	PersistentData.set("shmode", nil)
+	PersistentData.set("shtarget", nil)
 end
 
 return ServerHop
@@ -109003,9 +109248,6 @@ local Visuals = require("Features/Visuals/Visuals")
 ---@module Features.Visuals.ProximityList
 local ProximityList = require("Features/Visuals/ProximityList")
 
----@module Features.Visuals.TargetHUD
-local TargetHUD = require("Features/Visuals/TargetHUD")
-
 ---@module Features.Game.Removal
 local Removal = require("Features/Game/Removal")
 
@@ -109076,7 +109318,6 @@ local INIT_ORDER = {
 	ExpApBreaker,
 	Visuals,
 	ProximityList,
-	TargetHUD,
 	Movement,
 	Monitoring,
 	Removal,
@@ -109119,7 +109360,6 @@ local DETACH_ORDER = {
 	Exploits,
 	Visuals,
 	ProximityList,
-	TargetHUD,
 	AutoLoot,
 	AutoBuilder,
 	AutoProg,
@@ -111473,6 +111713,7 @@ return LPH_NO_VIRTUALIZE(function()
 
 	---@module Utility.CoreGuiManager
 	local CoreGuiManager = require("Utility/CoreGuiManager")
+	local WidgetChrome = require("GUI/WidgetChrome")
 
 	local visualizerMaid = Maid.new()
 
@@ -111485,37 +111726,15 @@ return LPH_NO_VIRTUALIZE(function()
 	screenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
 	screenGui.Enabled = false
 
-	local outer = Instance.new("Frame")
-	outer.Name = "Outer"
-	outer.BackgroundColor3 = Color3.new(1, 1, 1)
-	outer.Position = UDim2.new(0.27, 0, 0.216, 0)
-	outer.BorderColor3 = Color3.new()
-	outer.Size = UDim2.new(0, 260, 0, 301.75)
-	outer.ZIndex = 100
-	outer.Parent = screenGui
-
-	local inner = Instance.new("Frame")
-	inner.Name = "Inner"
-	inner.BackgroundColor3 = Library.MainColor
-	inner.BorderMode = Enum.BorderMode.Inset
-	inner.BorderColor3 = Library.OutlineColor
-	inner.Size = UDim2.new(1, 0, 1, 0)
-	inner.Parent = outer
-
-	local animationVisualizer = Instance.new("TextLabel")
-	animationVisualizer.Name = "AnimationVisualizer"
-	animationVisualizer.FontFace = Font.new("rbxasset://fonts/families/RobotoMono.json")
-	animationVisualizer.TextColor3 = Library.AccentColor
-	animationVisualizer.Text = "Animation Visualizer"
-	animationVisualizer.BackgroundColor3 = Color3.new()
-	animationVisualizer.BorderSizePixel = 0
-	animationVisualizer.BackgroundTransparency = 1
-	animationVisualizer.Position = UDim2.new(0, 5, 0, 5)
-	animationVisualizer.TextXAlignment = Enum.TextXAlignment.Left
-	animationVisualizer.BorderColor3 = Color3.new()
-	animationVisualizer.TextSize = 17
-	animationVisualizer.Size = UDim2.new(1, 0, 0, 20)
-	animationVisualizer.Parent = inner
+	local chrome = WidgetChrome(Library, {
+		name="AnimationVisualizerWidget", title="Animation Visualizer", parent=screenGui,
+		position=UDim2.new(0.27,0,0.216,0), size=UDim2.fromOffset(260,334), visible=true, zIndex=100,
+		onClose=function()
+			local toggle=Toggles and Toggles.ShowAnimationVisualizer
+			if toggle then toggle:SetValue(false) else AnimationVisualizer.visible(false) end
+		end,
+	})
+	local outer, inner = chrome.frame, chrome.body
 
 	local sliderOuter = Instance.new("Frame")
 	sliderOuter.Name = "SliderOuter"
@@ -111621,7 +111840,7 @@ return LPH_NO_VIRTUALIZE(function()
 	viewportFrame.BorderMode = Enum.BorderMode.Inset
 	viewportFrame.LightColor = Color3.new(0.549, 0.525, 0.435)
 	viewportFrame.Ambient = Color3.new(0.318, 0.318, 0.318)
-	viewportFrame.Position = UDim2.new(0, 4, 0, 26)
+	viewportFrame.Position = UDim2.new(0, 4, 0, 4)
 	viewportFrame.BackgroundColor3 = Library.MainColor
 	viewportFrame.BorderColor3 = Color3.new()
 	viewportFrame.Size = UDim2.new(1, -8, 0, 195)
@@ -111650,7 +111869,7 @@ return LPH_NO_VIRTUALIZE(function()
 	local noViewportFrame = Instance.new("Frame")
 	noViewportFrame.Name = "NoViewportFrame"
 	noViewportFrame.BackgroundColor3 = Library.MainColor
-	noViewportFrame.Position = UDim2.new(0, 4, 0, 26)
+	noViewportFrame.Position = UDim2.new(0, 4, 0, 4)
 	noViewportFrame.BorderColor3 = Color3.new()
 	noViewportFrame.BorderMode = Enum.BorderMode.Inset
 	noViewportFrame.Size = UDim2.new(1, -8, 0, 195)
@@ -111962,9 +112181,16 @@ return LPH_NO_VIRTUALIZE(function()
 		end
 	end
 
+	local playbackConnection
+	local initialized = false
 	---@param state boolean
 	function AnimationVisualizer.visible(state)
-		screenGui.Enabled = state
+		screenGui.Enabled = state == true
+		if screenGui.Enabled and initialized and not playbackConnection then
+			playbackConnection = Signal.new(runService.PreRender):connect("AnimationVisualizer_PlaybackLoop", onPlaybackLoop)
+		elseif not screenGui.Enabled and playbackConnection then
+			playbackConnection:Disconnect();playbackConnection = nil
+		end
 	end
 
 	---@param message string
@@ -111979,14 +112205,8 @@ return LPH_NO_VIRTUALIZE(function()
 		screenGui.Enabled = false
 		screenGui.DisplayOrder = 1
 
-		Library:MakeDraggable(outer)
-
 		Library:AddToRegistry(color, {
 			BackgroundColor3 = "AccentColor",
-		}, true)
-
-		Library:AddToRegistry(animationVisualizer, {
-			TextColor3 = "AccentColor",
 		}, true)
 
 		Library:AddToRegistry(hideBorderRight, {
@@ -112004,12 +112224,12 @@ return LPH_NO_VIRTUALIZE(function()
 
 		Library:AddToRegistry(playStop, {
 			BackgroundColor3 = "MainColor",
-			BorderColor3 = "Black",
+			BorderColor3 = "OutlineColor",
 		}, true)
 
 		Library:AddToRegistry(animationTextbox, {
 			BackgroundColor3 = "MainColor",
-			BorderColor3 = "Black",
+			BorderColor3 = "OutlineColor",
 			TextColor3 = "FontColor",
 		}, true)
 
@@ -112035,31 +112255,31 @@ return LPH_NO_VIRTUALIZE(function()
 
 		Library:AddToRegistry(noViewportFrame, {
 			BackgroundColor3 = "MainColor",
-			BorderColor3 = "Black",
+			BorderColor3 = "OutlineColor",
 		}, true)
 
 		Library:AddToRegistry(frameBackwards, {
 			BackgroundColor3 = "MainColor",
-			BorderColor3 = "Black",
+			BorderColor3 = "OutlineColor",
 		}, true)
 
 		Library:AddToRegistry(frameForwards, {
 			BackgroundColor3 = "MainColor",
-			BorderColor3 = "Black",
+			BorderColor3 = "OutlineColor",
 		}, true)
 
 		Library:AddToRegistry(viewportFrame, {
 			BackgroundColor3 = "MainColor",
-			BorderColor3 = "Black",
+			BorderColor3 = "OutlineColor",
 		}, true)
 
 		Library:AddToRegistry(sliderOuter, {
-			BorderColor3 = "Black",
+			BorderColor3 = "OutlineColor",
 		}, true)
 
 		Library:AddToRegistry(sliderInner, {
 			BackgroundColor3 = "MainColor",
-			BorderColor3 = "Black",
+			BorderColor3 = "OutlineColor",
 		}, true)
 
 		Library:AddToRegistry(sliderFill, {
@@ -112080,7 +112300,6 @@ return LPH_NO_VIRTUALIZE(function()
 		AnimationVisualizer.message("Waiting For Animation ID")
 
 		local idFocusLost = Signal.new(animationTextbox.FocusLost)
-		local preRender = Signal.new(runService.PreRender)
 		local playStopClicked = Signal.new(playStop.MouseButton1Click)
 		local outerInputBegan = Signal.new(outer.InputBegan)
 		local frameBackwardsClick = Signal.new(frameBackwards.MouseButton1Click)
@@ -112092,18 +112311,92 @@ return LPH_NO_VIRTUALIZE(function()
 		visualizerMaid:add(frameBackwardsClick:connect("AnimationVisualizer_FrameBackwardsClick", onFrameBackwards))
 		visualizerMaid:add(outerInputBegan:connect("AnimationVisualizer_OuterInputBegan", outerFrameInputBegan))
 		visualizerMaid:add(playStopClicked:connect("AnimationVisualizer_PlayStopClicked", togglePlayStop))
-		visualizerMaid:add(preRender:connect("AnimationVisualizer_PlaybackLoop", onPlaybackLoop))
 		visualizerMaid:add(idFocusLost:connect("AnimationVisualizer_IdFocusLost", onIdFocusLost))
 
+		for _,surface in ipairs({playStop, frameBackwards, frameForwards, animationTextbox, viewportFrame, noViewportFrame, sliderOuter}) do
+			surface.BorderColor3 = Library.OutlineColor
+			Library:StyleSurface(surface, 4, 0.55)
+		end
 		Library.AnimationVisualizerFrame = outer
+		initialized = true
+		if screenGui.Enabled then AnimationVisualizer.visible(true) end
 	end
 
 	function AnimationVisualizer.detach()
+		AnimationVisualizer.visible(false)
+		initialized = false
 		visualizerMaid:clean()
 	end
 
 	return AnimationVisualizer
 end)()
+
+end)
+__bundle_register("GUI/WidgetChrome", function(require, _LOADED, __bundle_register, __bundle_modules)
+-- Shared title bar and close control for independent Aero widgets.
+return function(library, options)
+ local z=options.zIndex or 200
+ local outer=library:Create("Frame",{Name=options.name or "AeroWidget",Parent=options.parent or library.ScreenGui,
+  Position=options.position or UDim2.fromOffset(100,100),Size=options.size or UDim2.fromOffset(280,300),
+  BackgroundColor3=library.MainColor,BorderColor3=library.OutlineColor,BorderSizePixel=0,
+  Visible=options.visible==true,ZIndex=z})
+ library:AddToRegistry(outer,{BackgroundColor3="MainColor",BorderColor3="OutlineColor"},true)
+ library:StyleSurface(outer,6,0.55)
+ local scale=library:AddUIScale(outer)
+ local function fit()
+  if not outer.Visible or not outer.Parent or (outer.Parent:IsA("ScreenGui") and outer.Parent.Enabled==false) then return end
+  if library.Interface.drag and library.Interface.drag.frame==outer then return end
+  local area=library:GetInterfaceViewport()
+  local size,pos,anchor=outer.Size,outer.Position,outer.AnchorPoint
+  local width=(area.X*size.X.Scale+size.X.Offset)*library.UIScale
+  local height=(area.Y*size.Y.Scale+size.Y.Offset)*library.UIScale
+  local x=area.X*pos.X.Scale+pos.X.Offset-width*anchor.X
+  local y=area.Y*pos.Y.Scale+pos.Y.Offset-height*anchor.Y
+  local nx=math.clamp(x,0,math.max(0,area.X-width))
+  local ny=math.clamp(y,0,math.max(0,area.Y-height))
+  if x~=nx or y~=ny then outer.Position=UDim2.fromOffset(nx+width*anchor.X,ny+height*anchor.Y) end
+ end
+ outer:GetPropertyChangedSignal("Visible"):Connect(fit)
+ outer:GetPropertyChangedSignal("Position"):Connect(fit)
+ scale:GetPropertyChangedSignal("Scale"):Connect(fit)
+ if outer.Parent:IsA("ScreenGui") then outer.Parent:GetPropertyChangedSignal("Enabled"):Connect(fit) end
+ local cameraConnection
+ local function watchCamera()
+  if cameraConnection then cameraConnection:Disconnect();cameraConnection=nil end
+  if workspace.CurrentCamera then cameraConnection=workspace.CurrentCamera:GetPropertyChangedSignal("ViewportSize"):Connect(fit) end
+  fit()
+ end
+ library:GiveSignal(workspace:GetPropertyChangedSignal("CurrentCamera"):Connect(watchCamera))
+ library:GiveSignal({Disconnect=function()if cameraConnection then cameraConnection:Disconnect();cameraConnection=nil end end})
+ watchCamera()
+ local header=library:Create("Frame",{Name="WidgetHeader",BackgroundTransparency=1,BorderSizePixel=0,
+  Size=UDim2.new(1,0,0,32),ZIndex=z+1,Parent=outer})
+ local title=library:Create("TextLabel",{Name="WidgetTitle",Text=options.title,FontFace=library.Font,
+  TextColor3=library.FontColor,TextSize=13,TextXAlignment=Enum.TextXAlignment.Left,
+  TextTruncate=Enum.TextTruncate.AtEnd,BackgroundTransparency=1,BorderSizePixel=0,
+  Position=UDim2.fromOffset(10,0),Size=UDim2.new(1,-48,1,0),ZIndex=z+2,Parent=header})
+ library:AddToRegistry(title,{TextColor3="FontColor"},true)
+ local divider=library:Create("Frame",{Name="WidgetDivider",BackgroundColor3=library.OutlineColor,
+  BackgroundTransparency=0.45,BorderSizePixel=0,Position=UDim2.new(0,8,1,-1),Size=UDim2.new(1,-16,0,1),ZIndex=z+2,Parent=header})
+ library:AddToRegistry(divider,{BackgroundColor3="OutlineColor"},true)
+ local close=library:Create("TextButton",{Name="CloseWidget",Text="×",FontFace=library.Font,TextSize=19,
+  TextColor3=library.FontColor,BackgroundColor3=library.MainColor,BorderColor3=library.OutlineColor,
+  BackgroundTransparency=1,AutoButtonColor=false,Size=UDim2.fromOffset(24,24),
+  Position=UDim2.new(1,-28,0,4),ZIndex=z+3,Parent=header})
+ library:AddToRegistry(close,{TextColor3="FontColor",BackgroundColor3="MainColor",BorderColor3="OutlineColor"},true)
+ library:StyleSurface(close,4,1)
+ close.MouseEnter:Connect(function()library:Animate(close,{BackgroundTransparency=0.3},0.12)end)
+ close.MouseLeave:Connect(function()library:Animate(close,{BackgroundTransparency=1},0.12)end)
+ library.DragBlockers[close]=true
+ library:GiveSignal({Disconnect=function()library.DragBlockers[close]=nil end})
+ local body=library:Create("Frame",{Name="WidgetBody",BackgroundTransparency=1,BorderSizePixel=0,
+  Position=UDim2.fromOffset(0,32),Size=UDim2.new(1,0,1,-32),ZIndex=z+1,Parent=outer})
+ library:MakeDraggable(outer,32)
+ close.Activated:Connect(function()
+  if options.onClose then options.onClose() else outer.Visible=false end
+ end)
+ return {frame=outer,body=body,header=header,title=title,close=close}
+end
 
 end)
 __bundle_register("Features/Combat/ExpApBreaker", function(require, _LOADED, __bundle_register, __bundle_modules)
@@ -115607,293 +115900,6 @@ return LPH_NO_VIRTUALIZE(function()
 end)()
 
 end)
-__bundle_register("Features/Visuals/TargetHUD", function(require, _LOADED, __bundle_register, __bundle_modules)
--- Target HUD: a compact, draggable on-screen panel showing the current best target's name, level,
--- distance, and stat bars (health + any of posture/blood/sanity the entity exposes). There is no
--- prebuilt target HUD in the YSL library -- only the Library.TargetHUDFrame scaffolding (HUD-transparency
--- + layout hook) -- so this builds the frame and assigns it there, then drives it from Targeting.best().
-
----@module Utility.Signal
-local Signal = require("Utility/Signal")
-
----@module Utility.Configuration
-local Configuration = require("Utility/Configuration")
-
----@module Features.Combat.Targeting
-local Targeting = require("Features/Combat/Targeting")
-
-local players = game:GetService("Players")
-local runService = game:GetService("RunService")
-
-local TargetHUD = {}
-
--- Bars drawn top-to-bottom. "health" reads the Humanoid; the rest read a child value-store object
--- (entity:FindFirstChild(store).Value / .MaxValue) exactly like the player ESP does.
-local BAR_SPECS = {
-	{ id = "health", label = "HP", color = Color3.fromRGB(86, 214, 110) },
-	{ id = "posture", label = "POS", color = Color3.fromRGB(240, 170, 60), store = "BreakMeter" },
-	{ id = "blood", label = "BLD", color = Color3.fromRGB(214, 64, 72), store = "Blood" },
-	{ id = "sanity", label = "SAN", color = Color3.fromRGB(150, 110, 222), store = "Sanity" },
-}
-
-local UPDATE_INTERVAL = 0.08
-
-local frame
-local nameLabel
-local distLabel
-local bars = {}
-local built = false
-local lastUpdate = 0
-
----@param parent Instance
----@param order number
----@param spec table
----@return table
-local function makeBar(parent, order, spec)
-	local row = Library:Create("Frame", {
-		Name = spec.id .. "Bar",
-		BackgroundTransparency = 1,
-		Size = UDim2.new(1, 0, 0, 14),
-		LayoutOrder = order,
-		Parent = parent,
-	})
-
-	local tag = Library:Create("TextLabel", {
-		BackgroundTransparency = 1,
-		Position = UDim2.fromOffset(0, 0),
-		Size = UDim2.fromOffset(30, 14),
-		Font = Enum.Font.GothamBold,
-		TextSize = 10,
-		TextColor3 = Library.FontColor,
-		Text = spec.label,
-		TextXAlignment = Enum.TextXAlignment.Left,
-		TextYAlignment = Enum.TextYAlignment.Center,
-		Parent = row,
-	})
-	Library:AddToRegistry(tag, { TextColor3 = "FontColor" }, true)
-
-	local track = Library:Create("Frame", {
-		Name = "Track",
-		BackgroundColor3 = Library.BackgroundColor,
-		BorderSizePixel = 0,
-		Position = UDim2.new(0, 32, 0.5, -4),
-		Size = UDim2.new(1, -32, 0, 8),
-		Parent = row,
-	})
-	Library:AddToRegistry(track, { BackgroundColor3 = "BackgroundColor" }, true)
-
-	local fill = Library:Create("Frame", {
-		Name = "Fill",
-		BackgroundColor3 = spec.color,
-		BorderSizePixel = 0,
-		Size = UDim2.fromScale(0, 1),
-		Parent = track,
-	})
-
-	local valueText = Library:Create("TextLabel", {
-		BackgroundTransparency = 1,
-		Size = UDim2.fromScale(1, 1),
-		Font = Enum.Font.Gotham,
-		TextSize = 9,
-		TextColor3 = Color3.new(1, 1, 1),
-		TextStrokeColor3 = Color3.new(0, 0, 0),
-		TextStrokeTransparency = 0.35,
-		Text = "",
-		Parent = track,
-	})
-
-	return { row = row, fill = fill, text = valueText }
-end
-
-local function build()
-	if built then
-		return
-	end
-	built = true
-
-	frame = Library:Create("Frame", {
-		Name = "YSL_TargetHUD",
-		Active = true,
-		AnchorPoint = Vector2.new(0.5, 0),
-		AutomaticSize = Enum.AutomaticSize.Y,
-		BackgroundColor3 = Library.MainColor,
-		BackgroundTransparency = Library.HudTransparency or 0.18,
-		BorderSizePixel = 0,
-		Position = UDim2.new(0.5, 0, 0, 120),
-		Size = UDim2.fromOffset(224, 0),
-		Visible = false,
-		ZIndex = 90,
-		Parent = Library.ScreenGui,
-	})
-	-- Hook into the library's scaffolding: HUD-transparency and layout both key off Library.TargetHUDFrame.
-	Library.TargetHUDFrame = frame
-	Library:AddUIScale(frame)
-	Library:MakeDraggable(frame, 10)
-	Library:AddToRegistry(frame, { BackgroundColor3 = "MainColor" }, true)
-
-	local stroke = Library:Create("UIStroke", {
-		Color = Library.AccentColor,
-		Thickness = 1,
-		Transparency = 0.2,
-		ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
-		Parent = frame,
-	})
-	Library:AddToRegistry(stroke, { Color = "AccentColor" })
-
-	Library:Create("UIPadding", {
-		PaddingTop = UDim.new(0, 6),
-		PaddingBottom = UDim.new(0, 6),
-		PaddingLeft = UDim.new(0, 8),
-		PaddingRight = UDim.new(0, 8),
-		Parent = frame,
-	})
-
-	Library:Create("UIListLayout", {
-		FillDirection = Enum.FillDirection.Vertical,
-		SortOrder = Enum.SortOrder.LayoutOrder,
-		Padding = UDim.new(0, 3),
-		Parent = frame,
-	})
-
-	local header = Library:Create("Frame", {
-		Name = "Header",
-		BackgroundTransparency = 1,
-		Size = UDim2.new(1, 0, 0, 16),
-		LayoutOrder = 0,
-		Parent = frame,
-	})
-
-	nameLabel = Library:Create("TextLabel", {
-		BackgroundTransparency = 1,
-		Size = UDim2.new(1, -62, 1, 0),
-		Font = Enum.Font.GothamBold,
-		TextSize = 13,
-		TextColor3 = Library.FontColor,
-		TextXAlignment = Enum.TextXAlignment.Left,
-		TextYAlignment = Enum.TextYAlignment.Center,
-		TextTruncate = Enum.TextTruncate.AtEnd,
-		Text = "Target",
-		Parent = header,
-	})
-	Library:AddToRegistry(nameLabel, { TextColor3 = "FontColor" }, true)
-
-	distLabel = Library:Create("TextLabel", {
-		AnchorPoint = Vector2.new(1, 0),
-		BackgroundTransparency = 1,
-		Position = UDim2.fromScale(1, 0),
-		Size = UDim2.fromOffset(60, 16),
-		Font = Enum.Font.Gotham,
-		TextSize = 11,
-		TextColor3 = Library.AccentColor,
-		TextXAlignment = Enum.TextXAlignment.Right,
-		TextYAlignment = Enum.TextYAlignment.Center,
-		Text = "",
-		Parent = header,
-	})
-	Library:AddToRegistry(distLabel, { TextColor3 = "AccentColor" }, true)
-
-	for index, spec in ipairs(BAR_SPECS) do
-		bars[spec.id] = makeBar(frame, index, spec)
-	end
-end
-
----@param bar table
----@param value number
----@param maxValue number
-local function setBar(bar, value, maxValue)
-	local ratio = 0
-	if maxValue and maxValue > 0 then
-		ratio = math.clamp(value / maxValue, 0, 1)
-	end
-	bar.fill.Size = UDim2.fromScale(ratio, 1)
-	bar.text.Text = string.format("%d / %d", math.floor(value + 0.5), math.floor((maxValue or 0) + 0.5))
-end
-
--- Reads a child value-store (.Value / .MaxValue). Returns nil if the entity doesn't expose it.
----@param entity Instance
----@param storeName string
----@return number?, number?
-local function readStore(entity, storeName)
-	local store = entity:FindFirstChild(storeName)
-	if not store then
-		return nil
-	end
-	local ok, value, maxValue = pcall(function()
-		return store.Value, store.MaxValue
-	end)
-	if ok and type(value) == "number" and type(maxValue) == "number" then
-		return value, maxValue
-	end
-	return nil
-end
-
-local function update()
-	if not Configuration.expectToggleValue("TargetHUD") then
-		if frame then
-			frame.Visible = false
-		end
-		return
-	end
-
-	build()
-
-	local best = Targeting.best()[1]
-	if not best or not best.character or not best.humanoid or best.humanoid.Health <= 0 then
-		frame.Visible = false
-		return
-	end
-
-	frame.Visible = true
-
-	local entity = best.character
-	local player = players:GetPlayerFromCharacter(entity)
-	local name = (player and (player:GetAttribute("CharacterName") or player.Name))
-		or entity:GetAttribute("MOB_rich_name")
-		or entity.Name
-	local level = entity:GetAttribute("Level")
-	nameLabel.Text = (level and string.format("%s  [Lv.%d]", tostring(name), level)) or tostring(name)
-	distLabel.Text = string.format("%.0fst", best.du or 0)
-
-	for _, spec in ipairs(BAR_SPECS) do
-		local bar = bars[spec.id]
-		if spec.id == "health" then
-			bar.row.Visible = true
-			setBar(bar, best.humanoid.Health, best.humanoid.MaxHealth)
-		else
-			local value, maxValue = readStore(entity, spec.store)
-			if value then
-				bar.row.Visible = true
-				setBar(bar, value, maxValue)
-			else
-				bar.row.Visible = false
-			end
-		end
-	end
-end
-
-local updateConnection = nil
-
-function TargetHUD.init()
-	local renderStepped = Signal.new(runService.RenderStepped)
-	updateConnection = renderStepped:connect("TargetHUD_Update", function()
-		if os.clock() - lastUpdate < UPDATE_INTERVAL then
-			return
-		end
-		lastUpdate = os.clock()
-		update()
-	end)
-end
-
-function TargetHUD.detach()
-	if updateConnection then
-		updateConnection:Disconnect()
-		updateConnection = nil
-	end
-end
-
-return TargetHUD
-
-end)
 __bundle_register("Features/Visuals/ProximityList", function(require, _LOADED, __bundle_register, __bundle_modules)
 -- ProximityList: an on-screen list of nearby players (name + distance), ported from project-rain's
 -- proximity_list. Draggable frame, updates ~0.15s, notifies on enter/leave, highlights voidwalkers.
@@ -119368,8 +119374,8 @@ EntityESP.cgb = LPH_NO_VIRTUALIZE(function(self, container, seperators, vertical
 		background.AnchorPoint = Vector2.new(0, 0)
 	end
 
-	background.BackgroundColor3 = Color3.new(0.06, 0.07, 0.09)
-	background.BackgroundTransparency = 0.15
+	background.BackgroundColor3 = Color3.new(0, 0, 0)
+	background.BackgroundTransparency = 0
 	background.BorderSizePixel = 0
 
 	self.gio(background, Color3.new(0, 0, 0), 0)
@@ -121900,7 +121906,7 @@ function Menu.init()
 		Center = true,
 		AutoShow = not shared.Aero.silent,
 		TabPadding = 16,
-		MenuFadeTime = 0.15,
+		MenuFadeTime = 0, -- Avoid per-element tweens when toggling a large menu.
 		Size = UDim2.fromOffset(500, 600),
 	})
 
@@ -122034,27 +122040,28 @@ function Menu.init()
 		end
 	end)
 
-	-- Deferred tab build: every tab except the first is created here, one per frame, so the menu is
-	-- visible and interactive immediately and the rest pop into the sidebar as they finish. The menu
-	-- keybind binding and autoload run only AFTER every tab exists -- their controls (Toggles/Options/
-	-- KeyPickers, incl. Options.MenuKeybind) must be built or saved configs, keybinds and default-on
-	-- features would read nil and silently not apply.
+	-- Build background tabs within a small per-frame time budget. Controls and autoload
+	-- still wait for every tab, while inexpensive tabs can share a frame.
 	task.spawn(function()
-		local function diagTab(n, f)
-			local ok, e = pcall(f, window)
-			if not ok then warn("[Aero/diag] " .. n .. ".init FAILED: " .. tostring(e)) end
-			task.wait()
+		local tabs = {
+			{ "GameTab", GameTab.init },
+			{ "VisualsTab", VisualsTab.init },
+			{ "AutomationTab", AutomationTab.init },
+			{ "ExploitTab", ExploitTab.init },
+			{ "AeroTab", AeroTab.init },
+			{ "TimingBuilderTab", TimingBuilderTab.init },
+			{ "AntiExploit", CombatTab.initAntiExploit },
+			{ "AdminTab", AdminTab.init },
+		}
+		local frameStarted = os.clock()
+		for index, tab in ipairs(tabs) do
+			local ok, e = pcall(tab[2], window)
+			if not ok then warn("[Aero/diag] " .. tab[1] .. ".init FAILED: " .. tostring(e)) end
+			if index < #tabs and os.clock() - frameStarted >= 0.004 then
+				task.wait()
+				frameStarted = os.clock()
+			end
 		end
-		diagTab("GameTab", GameTab.init)
-		diagTab("VisualsTab", VisualsTab.init)
-		diagTab("AutomationTab", AutomationTab.init)
-		diagTab("ExploitTab", ExploitTab.init)
-		diagTab("AeroTab", AeroTab.init)
-		diagTab("TimingBuilderTab", TimingBuilderTab.init)
-		diagTab("AntiExploit", CombatTab.initAntiExploit)
-		-- Custom tab is unfinished -- not registered yet (CustomTab.init is intentionally not called).
-		-- diagTab("CustomTab", CustomTab.init)
-		diagTab("AdminTab", AdminTab.init)
 
 		for order, name in ipairs({ "Combat", "Game", "Visuals", "Auto", "Exploit", "Builder", "Anti-Exploit", "Admin", "Settings" }) do
 			if window.Tabs[name] then window.Tabs[name]:SetLayoutOrder(order) end
@@ -122062,7 +122069,8 @@ function Menu.init()
 
 		Library.ToggleKeybind = Options.MenuKeybind
 
-		SaveManager:LoadAutoloadConfig()
+		SaveManager:BeginTracking()
+		SaveManager:LoadAutoloadConfig(function() return window.UserTabIntent == true end)
 		FirstRun(Library, SaveManager)
 
 		if not LPH_OBFUSCATED or shared.Aero.verbose then
@@ -125284,6 +125292,63 @@ return LPH_NO_VIRTUALIZE(function()
 			},
 		}
 
+		local function copy(value)
+			if type(value) ~= "table" then return value end
+			local result = {}
+			for key, child in pairs(value) do result[key] = copy(child) end
+			return result
+		end
+		local function same(a, b)
+			if type(a) ~= type(b) then return false end
+			if type(a) ~= "table" then return a == b end
+			for key, value in pairs(a) do if not same(value, b[key]) then return false end end
+			for key in pairs(b) do if a[key] == nil then return false end end
+			return true
+		end
+		function SaveManager:UpdateStatus()
+			local dirty = next(self.DirtyOptions or {}) ~= nil or next(self.DirtyFolds or {}) ~= nil
+			local text = self.Loading and "Loading config..." or dirty and "Unsaved changes" or self.Baseline and "Config saved" or "No config saved"
+			if self.StatusLabel and self.StatusText ~= text then self.StatusLabel:SetText(text); self.StatusText = text end
+			local window = self.Library and self.Library.Interface and self.Library.Interface.window
+			if window and window.SetConfigDirty and (self.StatusWindow ~= window or self.StatusDirty ~= dirty) then
+				window:SetConfigDirty(dirty); self.StatusWindow, self.StatusDirty = window, dirty
+			end
+		end
+		function SaveManager:CaptureBaseline()
+			local baseline = {}
+			for idx, object in pairs(Toggles) do
+				if not self.Ignore[idx] and self.Parser[object.Type] then baseline[idx] = copy(self.Parser[object.Type].Save(idx, object)) end
+			end
+			for idx, object in pairs(Options) do
+				if not self.Ignore[idx] and self.Parser[object.Type] then baseline[idx] = copy(self.Parser[object.Type].Save(idx, object)) end
+			end
+			self.Baseline = baseline
+			local state = self.Library:GetInterfaceState()
+			self.BaselineFolds = copy(state and state.folds or {})
+			self.DirtyOptions, self.DirtyFolds = {}, {}
+			self:UpdateStatus()
+		end
+		function SaveManager:BeginTracking()
+			self.Tracking = true
+			self.DirtyOptions, self.DirtyFolds = {}, {}
+			self:UpdateStatus()
+		end
+		function SaveManager:OptionChanged(idx)
+			if not self.Tracking or self.Loading or self.Ignore[idx] then return end
+			local object = Toggles[idx] or Options[idx]
+			local parser = object and self.Parser[object.Type]
+			if not parser then return end
+			self.DirtyOptions = self.DirtyOptions or {}
+			self.DirtyOptions[idx] = not self.Baseline or not same(parser.Save(idx, object), self.Baseline[idx]) or nil
+			self:UpdateStatus()
+		end
+		function SaveManager:FoldChanged(idx, expanded)
+			if not self.Tracking or self.Loading then return end
+			self.DirtyFolds = self.DirtyFolds or {}
+			self.DirtyFolds[idx] = not self.Baseline or (self.BaselineFolds[idx] ~= expanded) or nil
+			self:UpdateStatus()
+		end
+
 		function SaveManager:SetIgnoreIndexes(list)
 			for _, key in next, list do
 				self.Ignore[key] = true
@@ -125344,7 +125409,11 @@ return LPH_NO_VIRTUALIZE(function()
 				return false, "invalid backup data; nothing was overwritten"
 			end
 			-- Keep both the original backup and the profile replaced by this restore.
-			return replaceProfile(path, backup, ".restore.bak")
+			local restored, reason = replaceProfile(path, backup, ".restore.bak")
+			if restored and name == self.CurrentConfig then
+				self.DirtyOptions = self.DirtyOptions or {}; self.DirtyOptions.__restore = true; self:UpdateStatus()
+			end
+			return restored, reason
 		end
 
 		function SaveManager:Save(name)
@@ -125361,6 +125430,7 @@ return LPH_NO_VIRTUALIZE(function()
 				infoLoggerBlacklist = self.Library.InfoLoggerData.KeyBlacklistList,
 				infoLoggerCycle = self.Library.InfoLoggerData.InfoLoggerCycle,
 				animationVisualizerFramePosition = uDIm2Export(self.Library.AnimationVisualizerFrame.Position),
+				espPreviewFramePosition = self.Library.ESPPreviewFrame and uDIm2Export(self.Library.ESPPreviewFrame.Position) or nil,
 				overrideData = self.Library.OverrideData,
 			}
 
@@ -125388,10 +125458,12 @@ return LPH_NO_VIRTUALIZE(function()
 				return false, "failed to encode data"
 			end
 
-			return replaceProfile(fullPath, encoded, ".bak")
+			local saved, reason = replaceProfile(fullPath, encoded, ".bak")
+			if saved then self.Tracking = true; self.CurrentConfig = name; self:CaptureBaseline() end
+			return saved, reason
 		end
 
-		function SaveManager:Load(name)
+		function SaveManager:Load(name, preserveSelectedTab)
 			if not name then
 				return false, "no config file is selected"
 			end
@@ -125401,17 +125473,29 @@ return LPH_NO_VIRTUALIZE(function()
 				return false, "invalid file"
 			end
 
-			return self:LoadJSON(readfile(file))
+			return self:LoadJSON(readfile(file), name, preserveSelectedTab)
 		end
 
 		-- Shared by saved profiles and the bundled first-run preset. Apply the same ignore rules.
-		function SaveManager:LoadJSON(json)
+		function SaveManager:LoadJSON(json, name, preserveSelectedTab)
 			local success, decoded = pcall(httpService.JSONDecode, httpService, json)
 			if not success then
 				return false, "decode error"
 			end
 			if type(decoded) ~= "table" or type(decoded.objects) ~= "table" then
 				return false, "invalid config data"
+			end
+
+			self.LoadGeneration = (self.LoadGeneration or 0) + 1
+			local generation, pending, scheduled, failed = self.LoadGeneration, 0, false, false
+			self.Loading = true
+			self:UpdateStatus()
+			local function complete()
+				if scheduled and pending == 0 and self.LoadGeneration == generation then
+					self.Loading = false
+					if failed then self.DirtyOptions = { __loadError = true }; self:UpdateStatus()
+					else self.Tracking = true; self.CurrentConfig = name; self:CaptureBaseline() end
+				end
 			end
 
 			if decoded.keybindFramePosition then
@@ -125433,6 +125517,9 @@ return LPH_NO_VIRTUALIZE(function()
 			if decoded.animationVisualizerFramePosition then
 				self.Library.AnimationVisualizerFrame.Position = uDim2Import(decoded.animationVisualizerFramePosition)
 			end
+			if decoded.espPreviewFramePosition and self.Library.ESPPreviewFrame then
+				self.Library.ESPPreviewFrame.Position = uDim2Import(decoded.espPreviewFramePosition)
+			end
 
 			local timingList = Options["TimingOverrideList"]
 
@@ -125451,8 +125538,12 @@ return LPH_NO_VIRTUALIZE(function()
 			local applied = 0
 			for _, option in next, decoded.objects do
 				if not self.Ignore[option.idx] and self.Parser[option.type] then
+					pending = pending + 1
 					task.spawn(function()
-						self.Parser[option.type].Load(option.idx, option)
+						local ok = pcall(self.Parser[option.type].Load, option.idx, option)
+						if not ok then failed = true end
+						pending = pending - 1
+						complete()
 					end)
 
 					applied = applied + 1
@@ -125478,7 +125569,13 @@ return LPH_NO_VIRTUALIZE(function()
 				end
 			end
 
-			if decoded.interface then self.Library:ApplyInterfaceState(decoded.interface) end
+			if decoded.interface then
+				-- Evaluate after all yielding option loads, so interaction during loading also wins.
+				local preserve = type(preserveSelectedTab) == "function" and preserveSelectedTab() or false
+				self.Library:ApplyInterfaceState(decoded.interface, preserve)
+			end
+			scheduled = true
+			complete()
 			return true
 		end
 
@@ -125538,13 +125635,14 @@ return LPH_NO_VIRTUALIZE(function()
 
 		function SaveManager:SetLibrary(library)
 			self.Library = library
+			library.ConfigTracker = self
 		end
 
-		function SaveManager:LoadAutoloadConfig()
+		function SaveManager:LoadAutoloadConfig(preserveSelectedTab)
 			if isfile(self.Folder .. "/autoload.txt") then
 				local name = readfile(self.Folder .. "/autoload.txt")
 
-				local success, err = self:Load(name)
+				local success, err = self:Load(name, preserveSelectedTab)
 				if not success then
 					return self.Library:Notify("Failed to load autoload config: " .. err)
 				end
@@ -125556,6 +125654,9 @@ return LPH_NO_VIRTUALIZE(function()
 
 			local section = groupbox or tab:AddFullGroupbox("Config Manager")
 
+			self.StatusLabel = section:AddLabel("No config saved", true)
+			self.StatusText = nil
+			self:UpdateStatus()
 			section:AddInput("SaveManager_ConfigName", { Text = "Config name" })
 			section:AddDropdown(
 				"SaveManager_ConfigList",
@@ -125620,6 +125721,10 @@ return LPH_NO_VIRTUALIZE(function()
 				local path = self.Folder .. "/" .. name .. ".json"
 				local ok = pcall(delfile, path)
 				if not ok then return self.Library:Notify("Failed to delete config", 2) end
+				if self.CurrentConfig == name then
+					self.CurrentConfig, self.Baseline = nil, nil
+					self.DirtyOptions = { __deleted = true }; self:UpdateStatus()
+				end
 				local autoload = self.Folder .. "/autoload.txt"
 				if isfile(autoload) and readfile(autoload) == name then
 					delfile(autoload)
@@ -127138,100 +127243,6 @@ local ForceAutoRotate = require("Features/Combat/ForceAutoRotate")
 
 local AutoDustlunge = require("Features/Combat/AutoDustlunge")
 
--- Minimal modal confirm popup (aero's Library has no dialog primitive): dims the screen, shows a title +
--- message with Confirm / Cancel, and calls back with a boolean. Parented on top of Library.ScreenGui.
-local function confirmDialog(titleText, bodyText, onResult)
-	local backdrop = Library:Create("Frame", {
-		Name = "AeroConfirmDialog",
-		BackgroundColor3 = Color3.new(0, 0, 0),
-		BackgroundTransparency = 0.45,
-		BorderSizePixel = 0,
-		Position = UDim2.fromScale(0, 0),
-		Size = UDim2.fromScale(1, 1),
-		ZIndex = 999990,
-		Active = true,
-		Parent = Library.ScreenGui,
-	})
-
-	local dialog = Library:Create("Frame", {
-		AnchorPoint = Vector2.new(0.5, 0.5),
-		Position = UDim2.fromScale(0.5, 0.5),
-		Size = UDim2.fromOffset(360, 160),
-		BackgroundColor3 = Library.MainColor,
-		BorderColor3 = Library.OutlineColor,
-		BorderMode = Enum.BorderMode.Inset,
-		ZIndex = 999991,
-		Active = true,
-		Parent = backdrop,
-	})
-	Library:AddToRegistry(dialog, { BackgroundColor3 = "MainColor", BorderColor3 = "OutlineColor" })
-
-	Library:Create("TextLabel", {
-		BackgroundTransparency = 1,
-		Position = UDim2.fromOffset(10, 12),
-		Size = UDim2.new(1, -20, 0, 22),
-		Font = Enum.Font.GothamBold,
-		Text = titleText,
-		TextColor3 = Library.AccentColor,
-		TextSize = 18,
-		TextXAlignment = Enum.TextXAlignment.Center,
-		ZIndex = 999992,
-		Parent = dialog,
-	})
-
-	Library:Create("TextLabel", {
-		BackgroundTransparency = 1,
-		Position = UDim2.fromOffset(14, 44),
-		Size = UDim2.new(1, -28, 0, 58),
-		Font = Enum.Font.Gotham,
-		Text = bodyText,
-		TextColor3 = Library.FontColor,
-		TextSize = 15,
-		TextWrapped = true,
-		TextXAlignment = Enum.TextXAlignment.Center,
-		TextYAlignment = Enum.TextYAlignment.Top,
-		ZIndex = 999992,
-		Parent = dialog,
-	})
-
-	local done = false
-	local function finish(result)
-		if done then
-			return
-		end
-		done = true
-		pcall(function()
-			backdrop:Destroy()
-		end)
-		Library:SafeCallback(onResult, result)
-	end
-
-	local function makeButton(text, xScale, isAccent)
-		return Library:Create("TextButton", {
-			AnchorPoint = Vector2.new(0.5, 1),
-			Position = UDim2.new(xScale, 0, 1, -14),
-			Size = UDim2.fromOffset(150, 32),
-			BackgroundColor3 = isAccent and Library.AccentColor or Library.MainColor,
-			BorderColor3 = Library.OutlineColor,
-			BorderMode = Enum.BorderMode.Inset,
-			Font = Enum.Font.Gotham,
-			Text = text,
-			TextColor3 = Library.FontColor,
-			TextSize = 15,
-			AutoButtonColor = true,
-			ZIndex = 999993,
-			Parent = dialog,
-		})
-	end
-
-	makeButton("Confirm", 0.28, true).MouseButton1Click:Connect(function()
-		finish(true)
-	end)
-	makeButton("Cancel", 0.72, false).MouseButton1Click:Connect(function()
-		finish(false)
-	end)
-end
-
 ---@param tab table
 function CombatTab.initCombatTargetingSection(tab)
 	tab:AddDropdown("PlayerSelectionType", {
@@ -127775,31 +127786,6 @@ function CombatTab.initAntiBreakerSection(detectionBox, thresholdsBox)
 		"AntiBreakerKeybind",
 		{ Default = "N/A", SyncToggleState = true, Text = "Anti-AP Breaker" }
 	)
-
-	-- Confirm before enabling: Anti-AP Breaker degrades your AP, so require explicit acceptance. We snap
-	-- the toggle back off immediately and only re-enable it if the user picks Confirm.
-	local programmatic = false
-	local dialogOpen = false
-	toggle:OnChanged(function(state)
-		if programmatic or not state then
-			return
-		end
-		programmatic = true
-		toggle:SetValue(false)
-		programmatic = false
-		if dialogOpen then
-			return
-		end
-		dialogOpen = true
-		confirmDialog("Anti-AP Breaker", "THIS WILL MAKE AP SIGNIFICANTLY WORSE", function(confirmed)
-			dialogOpen = false
-			if confirmed then
-				programmatic = true
-				toggle:SetValue(true)
-				programmatic = false
-			end
-		end)
-	end)
 
 	-- Notifies you when a nearby player is flagged as trying to AP-break you (ported from Mira).
 	detectionBox:AddToggle("AntiBreakerNotify", {
@@ -131168,25 +131154,38 @@ local players = game:GetService("Players")
 
 ---@param tab table
 function ServerActions.init(tab)
+	local modes = tab:AddDropdown("ServerHopMode", {
+		Text = "Serverhop Mode",
+		Values = { "Small", "Large", "Server ID", "Previous Server" },
+		Default = 1,
+	})
+	local custom = tab:AddDependencyBox()
+	custom:AddInput("ServerHopTargetId", { Text = "Server ID", Default = "", Finished = true })
+	custom:SetupDependencies({ { modes, "Server ID" } })
+	modes:OnChanged(function() custom:Update() end)
 	tab:AddButton({
 		Text = "Serverhop",
 		DoubleClick = true,
-		Tooltip = "Click twice to join another server.",
+		Tooltip = "Click twice to join the selected server.",
 		Func = function()
 			local player = players.LocalPlayer
 			local slot = player and player:GetAttribute("DataSlot")
+			if type(slot) ~= "string" or slot == "" then slot = PersistentData.get("shslot") end
 			if type(slot) ~= "string" or slot == "" then
-				slot = PersistentData.get("shslot")
+				return Logger.notify("Serverhop failed: no data slot is selected.")
 			end
-			if type(slot) ~= "string" or slot == "" then
-				Logger.warn("Serverhop failed: no data slot is selected.")
-				return
+			local mode = Options.ServerHopMode.Value
+			local target
+			if mode == "Server ID" then
+				target = Options.ServerHopTargetId.Value:match("^%s*(.-)%s*$")
+			elseif mode == "Previous Server" then
+				target = PersistentData.get("shprevious")
 			end
-
-			local ok, err = pcall(ServerHop.hop, slot, true)
-			if not ok then
-				Logger.warn("Serverhop failed:", tostring(err))
+			if (mode == "Server ID" or mode == "Previous Server") and (type(target) ~= "string" or target == "" or #target > 128 or target:find("%c")) then
+				return Logger.notify("Serverhop failed: no valid server ID is available.")
 			end
+			local ok, err = pcall(ServerHop.hop, slot, true, mode, target)
+			if not ok then Logger.notify("Serverhop failed: %s", tostring(err)) end
 		end,
 	})
 end
@@ -131197,6 +131196,7 @@ end)
 __bundle_register("Menu/VisualsTab", function(require, _LOADED, __bundle_register, __bundle_modules)
 ---@module GUI.Icons
 local Icons = require("GUI/Icons")
+local Library = require("GUI/Library")
 
 ---@module Utility.Logger
 local Logger = require("Utility/Logger")
@@ -133433,67 +133433,61 @@ function VisualsTab.initProximitySection(groupbox)
 	})
 end
 
----@param groupbox table
-function VisualsTab.initTargetHUDSection(groupbox)
-	groupbox:AddToggle("TargetHUD", {
-		Text = "Target HUD",
-		Tooltip = "Show a draggable panel with the current target's name, level, distance, health, posture, blood and sanity.",
-		Default = false,
-	})
-
-	groupbox:AddLabel("Drag the panel to reposition it.")
-end
-
 function VisualsTab.init(window)
 	local tab = window:AddTab("Visuals", "Visuals", Icons.Visuals)
 
+	local entities = tab:AddCategory("Entities")
+	local world = tab:AddCategory("World")
+	local objects = tab:AddCategory("Objects")
+	local settings = tab:AddCategory("Settings")
+	local function box(category, title, side)
+		return category:AddGroupbox({ Name = title, Side = side })
+	end
+
+	local playerEspBox = box(entities, "Player ESP", 1)
+	VisualsTab.addPlayerESP(VisualsTab.addEntityESP(VisualsTab.initBaseESPSection("Player", playerEspBox)))
+	require("GUI/ESPPreview")(Library, playerEspBox)
+	VisualsTab.addFilterESP(VisualsTab.addEntityESP(VisualsTab.initBaseESPSection("Mob", box(entities, "Mob ESP", 2))))
+	VisualsTab.initBaseESPSection("NPC", box(entities, "NPC ESP", 1))
+	VisualsTab.initProximitySection(box(entities, "Player Proximity", 2))
+
+	VisualsTab.addFilterESP(VisualsTab.initBaseESPSection("AreaMarker", world:AddDynamicGroupbox("Area Marker ESP")))
+	VisualsTab.initBaseESPSection("VOIBoundaryESP", world:AddDynamicGroupbox("VOI Boundary ESP"))
+	VisualsTab.initBaseESPSection("ShopESP", world:AddDynamicGroupbox("Shop ESP"))
+	VisualsTab.initBaseESPSection("JobBoard", world:AddDynamicGroupbox("Job Board ESP"))
+	VisualsTab.initBaseESPSection("Whirlpool", world:AddDynamicGroupbox("Whirlpool ESP"))
+	VisualsTab.initBaseESPSection("GuildDoor", world:AddDynamicGroupbox("Guild Door ESP"))
+	VisualsTab.initBaseESPSection("GuildBanner", world:AddDynamicGroupbox("Guild Banner ESP"))
+
+	VisualsTab.addChestESP(VisualsTab.initBaseESPSection("Chest", box(objects, "Chest ESP", 2)))
+	VisualsTab.initBaseESPSection("BagDrop", objects:AddDynamicGroupbox("Bag ESP"))
+	VisualsTab.initBaseESPSection("VOIWeaponESP", objects:AddDynamicGroupbox("VOI Weapon ESP"))
+	VisualsTab.initBaseESPSection("Artifact", objects:AddDynamicGroupbox("Artifact ESP"))
+	VisualsTab.initBaseESPSection("WindrunnerOrb", objects:AddDynamicGroupbox("Windrunner Orb ESP"))
+	VisualsTab.initBaseESPSection("ExplosiveBarrel", objects:AddDynamicGroupbox("Explosive Barrel ESP"))
+	VisualsTab.initBaseESPSection("MinistryCacheIndicator", objects:AddDynamicGroupbox("Ministry Cache ESP"))
+	VisualsTab.initBaseESPSection("OwlFeathers", objects:AddDynamicGroupbox("Owl Feathers ESP"))
+	VisualsTab.addObeliskESP(VisualsTab.initBaseESPSection("Obelisk", objects:AddDynamicGroupbox("Obelisk ESP")))
+	VisualsTab.addBoneAltarESP(VisualsTab.initBaseESPSection("BoneAltar", objects:AddDynamicGroupbox("Bone Altar ESP")))
+	VisualsTab.addFilterESP(VisualsTab.initBaseESPSection("Ingredient", objects:AddDynamicGroupbox("Ingredient ESP")))
+	VisualsTab.initBaseESPSection("BoneSpear", objects:AddDynamicGroupbox("Bone Spear ESP"))
+	VisualsTab.initBaseESPSection("ArmorBrick", objects:AddDynamicGroupbox("Armor Brick ESP"))
+	VisualsTab.initBaseESPSection("BellMeteor", objects:AddDynamicGroupbox("Bell Meteor ESP"))
+	VisualsTab.initBaseESPSection("RareObelisk", objects:AddDynamicGroupbox("Rare Obelisk ESP"))
+	VisualsTab.initBaseESPSection("HealBrick", objects:AddDynamicGroupbox("Heal Brick ESP"))
+	VisualsTab.initBaseESPSection("MantraObelisk", objects:AddDynamicGroupbox("Mantra Obelisk ESP"))
+	VisualsTab.initBaseESPSection("BRWeapon", objects:AddDynamicGroupbox("BR Weapon ESP"))
+	VisualsTab.initBaseESPSection("BellKey", objects:AddDynamicGroupbox("Bell Key ESP"))
+
 	local GameTab = require("Menu/GameTab")
-	VisualsTab.initESPCustomization(tab:AddLeftGroupbox("ESP Customization"))
-	VisualsTab.initESPOptimizations(tab:AddRightGroupbox("ESP Optimizations"))
-	VisualsTab.initVisualRemovalsSection(tab:AddLeftGroupbox("Visual Removals"))
-	VisualsTab.initWorldVisualsSection(tab:AddRightGroupbox("World Visuals"))
-	local assistance = tab:AddRightGroupbox("Visual Assistance")
+	VisualsTab.initESPCustomization(box(settings, "ESP Customization", 1))
+	VisualsTab.initESPOptimizations(box(settings, "ESP Optimizations", 2))
+	VisualsTab.initVisualRemovalsSection(box(settings, "Visual Removals", 1))
+	VisualsTab.initWorldVisualsSection(box(settings, "World Visuals", 2))
+	local assistance = box(settings, "Visual Assistance", 2)
 	VisualsTab.initVisualAssistanceSection(assistance)
 	GameTab.initRevealAnimationsSection(assistance)
-
-	VisualsTab.addPlayerESP(
-		VisualsTab.addEntityESP(VisualsTab.initBaseESPSection("Player", tab:AddLeftGroupbox("Player ESP")))
-	)
-
-	VisualsTab.addFilterESP(
-		VisualsTab.addEntityESP(VisualsTab.initBaseESPSection("Mob", tab:AddRightGroupbox("Mob ESP")))
-	)
-
-	VisualsTab.initBaseESPSection("NPC", tab:AddLeftGroupbox("NPC ESP"))
-	VisualsTab.addChestESP(VisualsTab.initBaseESPSection("Chest", tab:AddRightGroupbox("Chest ESP")))
-	VisualsTab.initBaseESPSection("BagDrop", tab:AddDynamicGroupbox("Bag ESP"))
-	VisualsTab.addFilterESP(VisualsTab.initBaseESPSection("AreaMarker", tab:AddDynamicGroupbox("Area Marker ESP")))
-	VisualsTab.initBaseESPSection("VOIBoundaryESP", tab:AddDynamicGroupbox("VOI Boundary ESP"))
-	VisualsTab.initBaseESPSection("VOIWeaponESP", tab:AddDynamicGroupbox("VOI Weapon ESP"))
-	VisualsTab.initBaseESPSection("ShopESP", tab:AddDynamicGroupbox("Shop ESP"))
-	VisualsTab.initBaseESPSection("JobBoard", tab:AddDynamicGroupbox("Job Board ESP"))
-	VisualsTab.initBaseESPSection("Artifact", tab:AddDynamicGroupbox("Artifact ESP"))
-	VisualsTab.initBaseESPSection("WindrunnerOrb", tab:AddDynamicGroupbox("Windrunner Orb ESP"))
-	VisualsTab.initBaseESPSection("Whirlpool", tab:AddDynamicGroupbox("Whirlpool ESP"))
-	VisualsTab.initBaseESPSection("ExplosiveBarrel", tab:AddDynamicGroupbox("Explosive Barrel ESP"))
-	VisualsTab.initBaseESPSection("MinistryCacheIndicator", tab:AddDynamicGroupbox("Ministry Cache ESP"))
-	VisualsTab.initBaseESPSection("OwlFeathers", tab:AddDynamicGroupbox("Owl Feathers ESP"))
-	VisualsTab.initBaseESPSection("GuildDoor", tab:AddDynamicGroupbox("Guild Door ESP"))
-	VisualsTab.initBaseESPSection("GuildBanner", tab:AddDynamicGroupbox("Guild Banner ESP"))
-	VisualsTab.addObeliskESP(VisualsTab.initBaseESPSection("Obelisk", tab:AddDynamicGroupbox("Obelisk ESP")))
-	VisualsTab.addBoneAltarESP(VisualsTab.initBaseESPSection("BoneAltar", tab:AddDynamicGroupbox("Bone Altar ESP")))
-	VisualsTab.addFilterESP(VisualsTab.initBaseESPSection("Ingredient", tab:AddDynamicGroupbox("Ingredient ESP")))
-	VisualsTab.initBaseESPSection("BoneSpear", tab:AddDynamicGroupbox("Bone Spear ESP"))
-	VisualsTab.initBaseESPSection("ArmorBrick", tab:AddDynamicGroupbox("Armor Brick ESP"))
-	VisualsTab.initBaseESPSection("BellMeteor", tab:AddDynamicGroupbox("Bell Meteor ESP"))
-	VisualsTab.initBaseESPSection("RareObelisk", tab:AddDynamicGroupbox("Rare Obelisk ESP"))
-	VisualsTab.initBaseESPSection("HealBrick", tab:AddDynamicGroupbox("Heal Brick ESP"))
-	VisualsTab.initBaseESPSection("MantraObelisk", tab:AddDynamicGroupbox("Mantra Obelisk ESP"))
-	VisualsTab.initBaseESPSection("BRWeapon", tab:AddDynamicGroupbox("BR Weapon ESP"))
-	VisualsTab.initBaseESPSection("BellKey", tab:AddDynamicGroupbox("Bell Key ESP"))
-	VisualsTab.initProximitySection(tab:AddLeftGroupbox("Player Proximity"))
-	VisualsTab.initTargetHUDSection(tab:AddRightGroupbox("Target HUD"))
-	VisualsTab.initMorphLoaderSection(tab:AddLeftGroupbox("Morph Loader"))
+	VisualsTab.initMorphLoaderSection(box(settings, "Morph Loader", 1))
 end
 
 return VisualsTab
@@ -134651,6 +134645,442 @@ function FakeVoid.detach()
 end
 
 return FakeVoid
+
+end)
+__bundle_register("GUI/ESPPreview", function(require, _LOADED, __bundle_register, __bundle_modules)
+-- Player ESP sample; visual settings and the cached character update on events.
+return function(library, groupbox)
+ local previewToggle
+ local chrome=require("GUI/WidgetChrome")(library,{name="PlayerESPPreviewWidget",title="Player ESP Preview",
+  size=UDim2.fromOffset(300,350),position=UDim2.fromScale(0.68,0.2),zIndex=200,
+  onClose=function() if previewToggle then previewToggle:SetValue(false) end end})
+ library.ESPPreviewFrame=chrome.frame
+ local canvas = library:Create("Frame", {Name="ESPPreview", BackgroundColor3=library.BackgroundColor,
+  BorderColor3=library.OutlineColor, BorderSizePixel=0, Active=true,Position=UDim2.fromOffset(6,6),
+  Size=UDim2.new(1,-12,1,-12), ClipsDescendants=true, ZIndex=205, Parent=chrome.body})
+ library:AddToRegistry(canvas,{BackgroundColor3="BackgroundColor",BorderColor3="OutlineColor"})
+ library:StyleSurface(canvas,4,0.55)
+ local box = library:Create("Frame", {Name="SampleBox", BackgroundTransparency=1, BorderSizePixel=0,
+  ZIndex=207, AnchorPoint=Vector2.new(0.5,0.5),Position=UDim2.new(0.5,0,0,132),Size=UDim2.fromOffset(82,112),Parent=canvas})
+ local player=game:GetService("Players").LocalPlayer
+ local viewport=library:Create("ViewportFrame",{Name="CharacterViewport",BackgroundTransparency=1,
+  BorderSizePixel=0,Size=UDim2.fromOffset(82,112),AnchorPoint=Vector2.new(0.5,0.5),
+  Position=UDim2.new(0.5,0,0,132),ZIndex=206,Ambient=Color3.fromRGB(180,180,180),
+  LightColor=Color3.new(1,1,1),Parent=canvas})
+ local status=library:CreateLabel({Name="PreviewStatus",Text="Loading character...",TextSize=10,
+  TextColor3=library.FontColor,TextWrapped=true,BackgroundTransparency=1,Size=UDim2.fromScale(1,1),ZIndex=208,Parent=box})
+ library:AddToRegistry(status,{TextColor3="FontColor"})
+ local characterPreview=require("GUI/CharacterPreview")(library,canvas,viewport,status,player)
+ local input=game:GetService("UserInputService")
+ local hovering, drag = false, nil
+ local hint=library:CreateLabel({Name="PreviewHint",Text="Drag to rotate  •  Scroll: preview distance",TextSize=10,
+  TextColor3=library.FontColor,TextTransparency=0.35,BackgroundTransparency=1,BorderSizePixel=0,
+  Position=UDim2.new(0,6,1,-20),Size=UDim2.new(1,-12,0,16),ZIndex=209,Parent=canvas})
+ library:AddToRegistry(hint,{TextColor3="FontColor"})
+ local function zoomButton(text,x,delta)
+  local button=library:Create("TextButton",{Name=text=="+" and "ZoomIn" or "ZoomOut",Text=text,TextSize=14,FontFace=library.Font,
+   TextColor3=library.FontColor,BackgroundColor3=library.MainColor,BorderColor3=library.OutlineColor,
+   AutoButtonColor=false,Position=UDim2.new(1,x,0,5),Size=UDim2.fromOffset(22,22),ZIndex=210,Parent=canvas})
+  library:AddToRegistry(button,{TextColor3="FontColor",BackgroundColor3="MainColor",BorderColor3="OutlineColor"})
+  library:StyleSurface(button,4,0.55);library:BindControlBorder(button)
+  button.Activated:Connect(function() characterPreview.zoom(delta) end)
+  return button
+ end
+ local zoomOut=zoomButton("−",-52,-1)
+ local zoomIn=zoomButton("+",-27,1)
+ local moveConnection, endConnection
+ local function releaseInput()
+  if moveConnection then moveConnection:Disconnect();moveConnection=nil end
+  if endConnection then endConnection:Disconnect();endConnection=nil end
+ end
+ local function bindInput()
+  if moveConnection then return end
+  moveConnection=input.InputChanged:Connect(function(event)
+   if event.UserInputType==Enum.UserInputType.MouseWheel and hovering then
+    characterPreview.zoom(event.Position.Z);return
+   end
+   if not drag then return end
+   local point
+   if drag.input and event==drag.input then point=event.Position
+   elseif not drag.input and event.UserInputType==Enum.UserInputType.MouseMovement then point=input:GetMouseLocation() end
+   if point then characterPreview.rotate(point.X-drag.x,point.Y-drag.y);drag.x,drag.y=point.X,point.Y end
+  end)
+  endConnection=input.InputEnded:Connect(function(event)
+   if drag and ((drag.input and event==drag.input) or (not drag.input and event.UserInputType==Enum.UserInputType.MouseButton1)) then
+    drag=nil
+    if not hovering then library.DragBlockers[canvas]=nil;releaseInput() end
+   end
+  end)
+ end
+ canvas.MouseEnter:Connect(function() hovering=true;library.DragBlockers[canvas]=true;bindInput() end)
+ canvas.MouseLeave:Connect(function()
+  hovering=false
+  if not drag then library.DragBlockers[canvas]=nil;releaseInput() end
+ end)
+ canvas.InputBegan:Connect(function(event)
+  if event.UserInputType~=Enum.UserInputType.MouseButton1 and event.UserInputType~=Enum.UserInputType.Touch then return end
+  local touch=event.UserInputType==Enum.UserInputType.Touch
+  local point=touch and event.Position or input:GetMouseLocation()
+  drag={input=touch and event or nil,x=point.X,y=point.Y}
+  library.DragBlockers[canvas]=true;bindInput()
+ end)
+ library.Interface:RegisterInputCloser(function() drag=nil;hovering=false;library.DragBlockers[canvas]=nil;releaseInput() end)
+ library:GiveSignal({Disconnect=function() drag=nil;library.DragBlockers[canvas]=nil;releaseInput() end})
+ local title=library:CreateLabel({Name="SampleName",Text="Player",TextSize=12,TextColor3=Color3.new(1,1,1),
+  BackgroundTransparency=1,BorderSizePixel=0,Position=UDim2.new(0,-45,0,-46),Size=UDim2.new(1,90,0,44),TextWrapped=true,ZIndex=209,Parent=box})
+ local distanceLabel=library:CreateLabel({Name="SampleDistance",Text="--m",TextSize=12,TextColor3=Color3.new(1,1,1),
+  AnchorPoint=Vector2.new(0.5,0),BackgroundTransparency=1,BorderSizePixel=0,
+  Position=UDim2.new(0.5,0,1,4),Size=UDim2.fromOffset(120,16),ZIndex=209,Parent=box})
+ local lines={}
+ for i=1,8 do lines[i]=library:Create("Frame",{Name="BoxLine",BorderSizePixel=0,ZIndex=208,Parent=box}) end
+ local defs={
+  {"HealthBar","FullColor", "Left", "Humanoid"}, {"ArmorBar","ArmorBarColor","Left","Armor"},
+  {"PostureBar","PostureBarColor","Bottom","BreakMeter"}, {"BloodBar","BloodBarColor","Bottom","Blood"},
+  {"TempoBar","TempoBarColor","Bottom","Tempo"}, {"SanityBar","SanityBarColor","Bottom","Sanity"},
+ }
+ local bars={}
+ for _,def in ipairs(defs) do
+  local frame=library:Create("Frame",{Name=def[1],BackgroundColor3=Color3.new(0,0,0),BackgroundTransparency=0,BorderSizePixel=0,ZIndex=208,Parent=box})
+  local fill=library:Create("Frame",{Name="Fill",BorderSizePixel=0,ZIndex=209,Parent=frame})
+  bars[def[1]]={frame=frame,fill=fill,cuts={}}
+ end
+ local function value(id, default)
+  local option=Options["Player"..id]
+  return option and option.Value ~= nil and option.Value or default
+ end
+ local function enabled(id) local t=Toggles["Player"..id]; return t and t.Value == true end
+ local previewZoom, previewDistance=1,nil
+ local previewAlive=true
+ local function stat(name)
+  local character=player and player.Character
+  if not character then return nil,nil end
+  local object=name=="Humanoid" and character:FindFirstChildOfClass("Humanoid") or character:FindFirstChild(name)
+  if not object then return nil,nil end
+  local ok,current,maximum=pcall(function()
+   if name=="Humanoid" then return object.Health,object.MaxHealth end
+   return object.Value,object.MaxValue
+  end)
+  if not ok or type(current)~="number" or type(maximum)~="number" or current~=current or maximum~=maximum
+   or math.abs(current)==math.huge or math.abs(maximum)==math.huge or maximum<=0 then return nil,nil end
+  return current,maximum
+ end
+ local function update()
+  if not previewAlive or not chrome.frame.Visible then return end
+  local scale=math.clamp(1/previewZoom,0.25,1.55)
+  local boxWidth,boxHeight=82*scale,112*scale
+  box.Size=UDim2.fromOffset(boxWidth,boxHeight)
+  local thickness=math.clamp(tonumber(value("BoxThickness",1)) or 1,1,4)
+  local color=value("BoxColor",Color3.new(1,1,1))
+  local corners=value("BoxStyle","Classic")=="Corners"
+  local lengths={corners and boxWidth*0.25 or boxWidth,corners and boxWidth*0.25 or boxWidth,corners and boxWidth*0.25 or boxWidth,corners and boxWidth*0.25 or boxWidth,
+   corners and boxHeight*0.25 or boxHeight,corners and boxHeight*0.25 or boxHeight,corners and boxHeight*0.25 or boxHeight,corners and boxHeight*0.25 or boxHeight}
+  local positions={UDim2.fromOffset(0,0),UDim2.new(1,-lengths[2],0,0),UDim2.new(0,0,1,-thickness),UDim2.new(1,-lengths[4],1,-thickness),
+   UDim2.fromOffset(0,0),UDim2.new(1,-thickness,0,0),UDim2.new(0,0,1,-lengths[7]),UDim2.new(1,-thickness,1,-lengths[8])}
+  for i,line in ipairs(lines) do
+   line.Visible=enabled("BoundingBox") and (corners or i==1 or i==3 or i==5 or i==6)
+   line.Position=positions[i];line.Size=i<=4 and UDim2.fromOffset(lengths[i],thickness) or UDim2.fromOffset(thickness,lengths[i]);line.BackgroundColor3=color
+  end
+  title.TextColor3=value("Color",Color3.new(1,1,1))
+  title.TextTransparency=1-math.clamp(tonumber(value("TextOpacity",100)) or 100,0,100)/100
+  local name="Player"
+  if player then
+   local kind=value("PlayerNameType","Character Name")
+   if kind=="Roblox Username" then name=player.Name
+   elseif kind=="Roblox Display Name" then name=player.DisplayName
+   else name=player:GetAttribute("CharacterName") or player.DisplayName end
+  end
+  local health,maxHealth=stat("Humanoid")
+  local healthText=health and string.format("[%d/%d]",math.floor(health),math.floor(maxHealth)) or "[--/--]"
+  if health and enabled("ShowHealthPercent") then healthText=healthText..string.format(" (%d%%)",math.floor(math.clamp(health/maxHealth,0,1)*100)) end
+  title.Text=tostring(name).."\n"..healthText
+  local fontSize=math.clamp(tonumber(Options.FontSize and Options.FontSize.Value) or 13,4,24)
+  title.TextSize=math.clamp(fontSize*scale,8,22)
+  distanceLabel.TextSize=title.TextSize;distanceLabel.TextColor3=title.TextColor3;distanceLabel.TextTransparency=title.TextTransparency
+  distanceLabel.Visible=enabled("ShowDistance")
+  distanceLabel.Text=previewDistance and string.format("%dm",math.floor(previewDistance)) or "--m"
+  local stack={Left=0,Right=0,Bottom=0}
+  local width=math.clamp(tonumber(value("BarThickness",1)) or 1,1,5)
+  for _,def in ipairs(defs) do
+   local id,colorKey,defaultSide,statName=def[1],def[2],def[3],def[4]
+   local current,maximum=stat(statName)
+   local amount=current and math.clamp(current/maximum,0,1) or 0
+   local bar=bars[id];local show=enabled(id);bar.frame.Visible=show
+   if show then
+    local side=value(id.."Position",defaultSide);if stack[side]==nil then side=defaultSide end
+    local gap=stack[side];stack[side]=gap+width+3
+    local vertical=side~="Bottom"
+    bar.frame.Position=side=="Left" and UDim2.fromOffset(-gap-width-4,0) or side=="Right" and UDim2.new(1,4+gap,0,0) or UDim2.new(0,0,1,4+gap)
+    bar.frame.Size=vertical and UDim2.new(0,width+2,1,0) or UDim2.new(1,0,0,width+2)
+    bar.fill.AnchorPoint=vertical and Vector2.new(0,1) or Vector2.zero
+    bar.fill.Position=vertical and UDim2.new(0,1,1,-1) or UDim2.fromOffset(1,1)
+    bar.fill.Size=vertical and UDim2.new(1,-2,amount,-2) or UDim2.new(amount,-2,1,-2)
+    local fillColor=value(colorKey,Color3.new(1,1,1))
+    if id=="HealthBar" then
+     local empty=value("EmptyColor",Color3.new(1,0,0))
+     fillColor=Color3.new(empty.R+(fillColor.R-empty.R)*amount,empty.G+(fillColor.G-empty.G)*amount,empty.B+(fillColor.B-empty.B)*amount)
+    end
+    bar.fill.BackgroundColor3=fillColor
+    local segmented=enabled(id.."Segments")
+    local count=math.clamp(math.floor(tonumber(value(id.."SegmentCount",5)) or 5),2,20)
+    if segmented then
+     for i=1,count-1 do
+      if not bar.cuts[i] then bar.cuts[i]=library:Create("Frame",{Name="Segment",BackgroundColor3=Color3.new(0,0,0),BorderSizePixel=0,ZIndex=210,Parent=bar.frame}) end
+      local cut=bar.cuts[i];cut.Visible=true
+      cut.Position=vertical and UDim2.new(0,0,i/count,0) or UDim2.new(i/count,0,0,0)
+      cut.Size=vertical and UDim2.new(1,0,0,1) or UDim2.new(0,1,1,0)
+     end
+    end
+    for i,cut in ipairs(bar.cuts) do if not segmented or i>=count then cut.Visible=false end end
+   end
+  end
+  distanceLabel.Position=UDim2.new(0.5,0,1,4+stack.Bottom)
+ end
+ local ids={"Color","TextOpacity","EmptyColor","PlayerNameType","ShowHealthPercent","ShowDistance","BoundingBox","BoxColor","BoxStyle","BoxThickness","BarThickness"}
+ for _,def in ipairs(defs) do
+  for _,suffix in ipairs({def[1],def[2],def[1].."Position",def[1].."Segments",def[1].."SegmentCount"}) do ids[#ids+1]=suffix end
+ end
+ local installed={}
+ for _,id in ipairs(ids) do
+  local object=Toggles["Player"..id] or Options["Player"..id]
+  if object and not installed[object] then
+   installed[object]=true
+   local previous=object.Callback
+   object.Callback=function(...) update();if previous then previous(...) end end
+  end
+ end
+ local statSignals={}
+ local function clearStats() for _,signal in ipairs(statSignals) do signal:Disconnect() end;table.clear(statSignals) end
+ local function listen(signal,callback) if signal then statSignals[#statSignals+1]=signal:Connect(callback) end end
+ local function bindStats(character)
+  if not previewAlive then return end
+  clearStats()
+  if character and chrome.frame.Visible then
+   local function changed(child)
+    if child:IsA("Humanoid") or child.Name=="Armor" or child.Name=="BreakMeter" or child.Name=="Blood" or child.Name=="Tempo" or child.Name=="Sanity" then
+     task.defer(function() if player.Character==character then bindStats(character) end end)
+    end
+   end
+   listen(character.ChildAdded,changed);listen(character.ChildRemoved,changed)
+   local humanoid=character:FindFirstChildOfClass("Humanoid")
+   if humanoid then listen(humanoid.HealthChanged,update);listen(humanoid:GetPropertyChangedSignal("MaxHealth"),update) end
+   for _,def in ipairs(defs) do
+    if def[4]~="Humanoid" then
+     local item=character:FindFirstChild(def[4])
+     if item then
+      for _,prop in ipairs({"Value","MaxValue"}) do
+       local ok,signal=pcall(item.GetPropertyChangedSignal,item,prop);if ok then listen(signal,update) end
+      end
+     end
+    end
+   end
+  end
+  update()
+ end
+ if player then
+  library:GiveSignal(player:GetAttributeChangedSignal("CharacterName"):Connect(update))
+  library:GiveSignal(player.CharacterAdded:Connect(bindStats))
+  library:GiveSignal(player.CharacterRemoving:Connect(function() clearStats();task.defer(update) end))
+  bindStats(player.Character)
+ end
+ chrome.frame:GetPropertyChangedSignal("Visible"):Connect(function() bindStats(player and player.Character or nil) end)
+ library:GiveSignal({Disconnect=function() previewAlive=false;clearStats() end})
+ characterPreview.onViewChanged(function(zoom,distance) previewZoom,previewDistance=zoom,distance;update() end)
+ local fontOption=Options.FontSize
+ if fontOption then local previous=fontOption.Callback;fontOption.Callback=function(...) update();if previous then previous(...) end end end
+ previewToggle=groupbox:AddToggle("ShowPlayerESPPreview",{Text="Show Player ESP Preview",Default=false,
+  Callback=function(enabled) chrome.frame.Visible=enabled end})
+ previewToggle:AddKeyPicker("PlayerESPPreviewKeybind",{Default="N/A",SyncToggleState=true,Text="Player ESP Preview"})
+ update();groupbox:Resize()
+ return { frame=chrome.frame,close=chrome.close,toggle=previewToggle,canvas=canvas,box=box,lines=lines,bars=bars,title=title,update=update,
+  viewport=viewport,character=characterPreview,zoomIn=zoomIn,zoomOut=zoomOut,status=status,distance=distanceLabel }
+end
+
+end)
+__bundle_register("GUI/CharacterPreview", function(require, _LOADED, __bundle_register, __bundle_modules)
+-- Clone the local character only when the preview is visible or its appearance changes.
+return function(library, canvas, viewport, status, player)
+ local world=library:Create("WorldModel", {Name="PreviewWorld", Parent=viewport})
+ local camera=library:Create("Camera", {Name="PreviewCamera", FieldOfView=40, Parent=viewport})
+ viewport.CurrentCamera=camera
+ local alive, dirty, queued = true, true, false
+ local current, childAdded, childRemoved, descendantAdded, descendantRemoving, model
+ local appearanceSignals={}
+ local center, baseDistance, yaw, pitch, zoom = nil, nil, 0, 0, 1
+ local viewChanged
+ local connections={}
+ local function updateCamera()
+  if not alive or not center or not baseDistance then return end
+  local distance=baseDistance*zoom
+  local horizontal=math.cos(pitch)*distance
+  local offset=Vector3.new(math.sin(yaw)*horizontal, math.sin(pitch)*distance, -math.cos(yaw)*horizontal)
+  camera.CFrame=CFrame.lookAt(center+offset,center)
+  if viewChanged then viewChanged(zoom,distance) end
+ end
+ local function rotate(dx,dy)
+  if not alive then return end
+  yaw=(yaw+(tonumber(dx) or 0)*0.01)%(2*math.pi)
+  pitch=math.clamp(pitch-(tonumber(dy) or 0)*0.01,-0.7,0.7)
+  updateCamera()
+ end
+ local function adjustZoom(amount)
+  if not alive then return end
+  zoom=math.clamp(zoom*math.exp(-(tonumber(amount) or 0)*0.12),0.65,4)
+  updateCamera()
+ end
+ local function connect(signal, callback)
+  if signal then local c=signal:Connect(callback);connections[#connections+1]=c;return c end
+ end
+ local function visible()
+  local node=canvas
+  while node and node ~= library.ScreenGui do
+   if node:IsA("GuiObject") and not node.Visible then return false end
+   if node:IsA("ScrollingFrame") then
+    local top, bottom=canvas.AbsolutePosition.Y,canvas.AbsolutePosition.Y+canvas.AbsoluteSize.Y
+    local scrollTop, scrollBottom=node.AbsolutePosition.Y,node.AbsolutePosition.Y+node.AbsoluteSize.Y
+    if bottom < scrollTop or top > scrollBottom then return false end
+   end
+   node=node.Parent
+  end
+  return node == library.ScreenGui
+ end
+ local function removeModel()
+  if model then model:Destroy();model=nil end
+ end
+ local function cloneCharacter()
+  local character=player and player.Character
+  if not character or not character.Parent then
+   removeModel();status.Text="Waiting for character";status.Visible=true;viewport.Visible=false;return
+  end
+  local previous=character.Archivable
+  local ok, result=pcall(function()
+   character.Archivable=true
+   return character:Clone()
+  end)
+  character.Archivable=previous
+  if not ok or not result then
+   removeModel();status.Text="Character unavailable";status.Visible=true;viewport.Visible=false;return
+  end
+  local success=pcall(function()
+   for _,item in ipairs(result:GetDescendants()) do
+    if item:IsA("LuaSourceContainer") or item:IsA("Animator") or item:IsA("Sound") or item:IsA("Tool")
+     or item:IsA("ParticleEmitter") or item:IsA("Trail") or item:IsA("Beam") or item:IsA("BillboardGui") or item:IsA("Highlight") then
+     item:Destroy()
+    elseif item:IsA("BasePart") then
+     item.Anchored=true
+    end
+   end
+   result:PivotTo(CFrame.new(0,0,0))
+   local bounds, size=result:GetBoundingBox()
+   local distance=math.max(size.Y, size.X / (82/112)) / (2*math.tan(math.rad(camera.FieldOfView/2))) * 1.08 + size.Z/2
+   center,baseDistance=bounds.Position,distance
+   updateCamera()
+   result.Parent=world
+  end)
+  if not success then
+   result:Destroy();removeModel();status.Text="Character unavailable";status.Visible=true;viewport.Visible=false;return
+  end
+  removeModel();model=result;status.Visible=false;viewport.Visible=true
+ end
+ local function update()
+  if not alive then return end
+  if not visible() then viewport.Visible=false;return end
+  if dirty then dirty=false;cloneCharacter()
+  elseif model then viewport.Visible=true end
+ end
+ local function queue()
+  dirty=true
+  if queued then return end
+  queued=true
+  task.delay(0.15,function()
+   queued=false
+   if alive then update() end
+  end)
+ end
+ local bodyParts={Head=true,Torso=true,UpperTorso=true,LowerTorso=true,HumanoidRootPart=true,
+  ["Left Arm"]=true,["Right Arm"]=true,["Left Leg"]=true,["Right Leg"]=true,
+  LeftUpperArm=true,LeftLowerArm=true,LeftHand=true,RightUpperArm=true,RightLowerArm=true,RightHand=true,
+  LeftUpperLeg=true,LeftLowerLeg=true,LeftFoot=true,RightUpperLeg=true,RightLowerLeg=true,RightFoot=true}
+ local function appearanceChild(child)
+  local parent=child.Parent
+  if parent==current then
+   if child:IsA("Accessory") or child:IsA("Clothing") or child:IsA("BodyColors") or child:IsA("CharacterMesh") then return true end
+   return child:IsA("BasePart") and bodyParts[child.Name] == true
+  end
+  local ancestor=parent
+  while ancestor and ancestor~=current do
+   if ancestor:IsA("Accessory") then return true end
+   ancestor=ancestor.Parent
+  end
+  return parent and parent.Parent==current and parent.Name=="Head"
+   and (child:IsA("Decal") or child:IsA("SpecialMesh")) or false
+ end
+ local function unwatch(item)
+  local signals=appearanceSignals[item]
+  if signals then for _,connection in ipairs(signals) do connection:Disconnect() end end
+  appearanceSignals[item]=nil
+ end
+ local function watchAppearance(item)
+  if appearanceSignals[item] then return end
+  local properties={}
+  if item:IsA("Shirt") then properties={"ShirtTemplate"}
+  elseif item:IsA("Pants") then properties={"PantsTemplate"}
+  elseif item:IsA("ShirtGraphic") then properties={"Graphic"}
+  elseif item:IsA("BodyColors") then properties={"HeadColor3","LeftArmColor3","RightArmColor3","LeftLegColor3","RightLegColor3","TorsoColor3"}
+  elseif item:IsA("MeshPart") then properties={"MeshId","TextureID"}
+  elseif item:IsA("SpecialMesh") then properties={"MeshId","TextureId"}
+  elseif item:IsA("Decal") then properties={"Texture"} end
+  if #properties==0 then return end
+  local signals={};appearanceSignals[item]=signals
+  for _,property in ipairs(properties) do
+   local ok, signal=pcall(item.GetPropertyChangedSignal,item,property)
+   if ok and signal then signals[#signals+1]=signal:Connect(queue) end
+  end
+ end
+ local function clearCharacter()
+  if childAdded then childAdded:Disconnect();childAdded=nil end
+  if childRemoved then childRemoved:Disconnect();childRemoved=nil end
+  if descendantAdded then descendantAdded:Disconnect();descendantAdded=nil end
+  if descendantRemoving then descendantRemoving:Disconnect();descendantRemoving=nil end
+  for item in pairs(appearanceSignals) do unwatch(item) end
+ end
+ local function watchCharacter(character)
+  clearCharacter()
+  current=character
+  if character then
+   childAdded=character.ChildAdded:Connect(function(child) if appearanceChild(child) then queue() end end)
+   childRemoved=character.ChildRemoved:Connect(function(child) if appearanceChild(child) then queue() end end)
+   descendantAdded=character.DescendantAdded:Connect(function(item)
+    if appearanceChild(item) then watchAppearance(item);queue() end
+   end)
+   descendantRemoving=character.DescendantRemoving:Connect(function(item)
+    unwatch(item);if appearanceChild(item) then queue() end
+   end)
+   for _,item in ipairs(character:GetDescendants()) do if appearanceChild(item) then watchAppearance(item) end end
+  end
+  queue()
+ end
+ local node=canvas
+ while node and node ~= library.ScreenGui do
+  if node:IsA("GuiObject") then connect(node:GetPropertyChangedSignal("Visible"), update) end
+  if node:IsA("ScrollingFrame") then connect(node:GetPropertyChangedSignal("CanvasPosition"), update) end
+  node=node.Parent
+ end
+ connect(canvas:GetPropertyChangedSignal("AbsoluteSize"), update)
+ if player then
+  connect(player.CharacterAdded, watchCharacter)
+  connect(player.CharacterRemoving, function(character) if current==character then watchCharacter(nil) end end)
+  connect(player.CharacterAppearanceLoaded, function(character) if current==character then queue() end end)
+  watchCharacter(player.Character)
+ else status.Text="Character unavailable";status.Visible=true;viewport.Visible=false end
+ library:GiveSignal({Disconnect=function()
+  alive=false
+  clearCharacter()
+  for _,connection in ipairs(connections) do connection:Disconnect() end
+  removeModel()
+ end})
+ return {refresh=queue, update=update, rotate=rotate, zoom=adjustZoom, world=world, camera=camera,
+  onViewChanged=function(callback) viewChanged=callback;if baseDistance then callback(zoom,baseDistance*zoom) end end}
+end
 
 end)
 __bundle_register("Menu/TimingBuilderTab", function(require, _LOADED, __bundle_register, __bundle_modules)
